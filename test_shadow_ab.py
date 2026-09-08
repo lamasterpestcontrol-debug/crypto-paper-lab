@@ -12,6 +12,8 @@ class T(unittest.TestCase):
             self.assertIn("fast_route",cols)
             self.assertIn("fast_priority",cols)
             self.assertIn("deep_analysis",cols)
+            self.assertIn("persistence_fail_reason",cols)
+            self.assertIn("persistence_key_matches",cols)
 
     def test_fast_route_proxy(self):
         p={"pairCreatedAt":int(time.time()*1000)-30*60_000,
@@ -34,6 +36,29 @@ class T(unittest.TestCase):
             p=shadow_ab.persistence_for_token(db,"solana","abc",time.time(),2,True,True,True)
             self.assertEqual(p.streak,1)
             self.assertFalse(p.confirmed)
+
+    def test_persistence_three_tick_confirmed(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=shadow_ab.dbopen(Path(td)/"x.sqlite3")
+            now=time.time()
+            for i in range(2):
+                db.execute("""INSERT INTO strategy_ab_observations(
+                    ts,chain,address,challenger_state,challenger_score) VALUES(?,?,?,?,?)""",
+                    (now-120+60*i,"solana","same-token","WATCH",2.0))
+            db.commit()
+            p,d=shadow_ab.persistence_for_token(db,"solana","same-token",now,2.0,True,True,True,return_diag=True)
+            self.assertEqual(p.streak,3)
+            self.assertTrue(p.confirmed)
+            self.assertEqual(d["key_matches"],2)
+            self.assertEqual(d["failed"],"NONE")
+
+    def test_persistence_diagnostic_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=shadow_ab.dbopen(Path(td)/"x.sqlite3")
+            p,d=shadow_ab.persistence_for_token(db,"solana","abc",time.time(),0.2,True,False,True,return_diag=True)
+            self.assertEqual(p.streak,0)
+            self.assertIn("SCORE_LT_1",d["failed"])
+            self.assertIn("EXIT_FAIL",d["failed"])
 
 if __name__=="__main__":
     unittest.main()

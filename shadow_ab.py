@@ -60,6 +60,8 @@ def dbopen(path:Path):
       persistence_streak INTEGER,
       persistence_required INTEGER,
       persistence_confirmed INTEGER,
+      persistence_fail_reason TEXT,
+      persistence_key_matches INTEGER,
       fast_route TEXT,
       fast_priority REAL,
       deep_analysis INTEGER,
@@ -79,6 +81,8 @@ def dbopen(path:Path):
         ("persistence_streak","INTEGER"),
         ("persistence_required","INTEGER"),
         ("persistence_confirmed","INTEGER"),
+        ("persistence_fail_reason","TEXT"),
+        ("persistence_key_matches","INTEGER"),
         ("fast_route","TEXT"),
         ("fast_priority","REAL"),
         ("deep_analysis","INTEGER"),
@@ -168,7 +172,7 @@ def prediscovery_from_pair(pair, now):
     )
     return e,prediscovery_classify(e)
 
-def persistence_for_token(db,chain,address,now,current_score,risk_pass,exit_pass,liq_pass):
+def persistence_for_token(db,chain,address,now,current_score,risk_pass,exit_pass,liq_pass,return_diag=False):
     rows=db.execute("""SELECT ts,challenger_score,challenger_state
         FROM strategy_ab_observations
         WHERE chain=? AND address=? ORDER BY id DESC LIMIT 5""",(chain,address)).fetchall()
@@ -181,8 +185,23 @@ def persistence_for_token(db,chain,address,now,current_score,risk_pass,exit_pass
             exit_pass=(r["challenger_state"]!="REJECT"),
             liquidity_pass=(r["challenger_state"]!="REJECT"),
         ))
-    pts.append(SignalPoint(now,float(current_score or 0),risk_pass,exit_pass,liq_pass))
-    return persistence_check(pts,required=3,min_score=1.0)
+    score=float(current_score or 0)
+    pts.append(SignalPoint(now,score,risk_pass,exit_pass,liq_pass))
+    result=persistence_check(pts,required=3,min_score=1.0)
+    failed=[]
+    if score < 1.0: failed.append("SCORE_LT_1")
+    if not risk_pass: failed.append("RISK_FAIL")
+    if not exit_pass: failed.append("EXIT_FAIL")
+    if not liq_pass: failed.append("LIQUIDITY_FAIL")
+    diag={
+        "key_matches":len(rows),
+        "current_score":round(score,6),
+        "risk_pass":bool(risk_pass),
+        "exit_pass":bool(exit_pass),
+        "liquidity_pass":bool(liq_pass),
+        "failed":"|".join(failed) if failed else "NONE",
+    }
+    return (result,diag) if return_diag else result
 
 
 def fast_route_from_pair(pair, now):
@@ -221,11 +240,12 @@ def evaluate_one(db,chain,address,symbol,pair,now):
     if not slip.pass_check:
         state="REJECT"; reason="SLIPPAGE_TOO_HIGH"
     pre_e,pre_r=prediscovery_from_pair(pair,now)
-    pers=persistence_for_token(
+    pers,pers_diag=persistence_for_token(
         db,chain,address,now,d.score,
         risk_pass=(state!="REJECT"),
         exit_pass=slip.pass_check,
         liq_pass=(cur.liquidity>0),
+        return_diag=True,
     )
     raw={
         "audit":d.audit,
@@ -233,6 +253,7 @@ def evaluate_one(db,chain,address,symbol,pair,now):
         "prediscovery":{"evidence":pre_e.__dict__,"result":pre_r.__dict__,
                         "note":"CURRENTLY_PROXY_INPUTS_ONLY_NOT_FULL_REAL_DATA"},
         "persistence":pers.__dict__,
+        "persistence_diag":pers_diag,
         "fast_route":route.__dict__,
         "mode":"SHADOW_ONLY",
     }
@@ -241,16 +262,18 @@ def evaluate_one(db,chain,address,symbol,pair,now):
           ts,chain,address,symbol,price,liquidity,volume_h1,volume_h24,buys_h1,sells_h1,
           control_state,challenger_state,challenger_reason,challenger_score,max_safe_usd,regime,
           prediscovery_stage,prediscovery_score,persistence_streak,persistence_required,persistence_confirmed,
-          fast_route,fast_priority,deep_analysis,raw_json)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          persistence_fail_reason,persistence_key_matches,fast_route,fast_priority,deep_analysis,raw_json)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (now,chain,address,symbol,cur.price,cur.liquidity,cur.volume_h1,cur.volume_h24,
            cur.buys_h1,cur.sells_h1,control_state(pair),state,reason,d.score,
            min(d.max_safe_usd,slip.max_safe_usd),regime,
            pre_r.stage,pre_r.score,pers.streak,pers.required,1 if pers.confirmed else 0,
-           route.route,route.priority,1 if route.deep_analysis else 0,
+           pers_diag["failed"],pers_diag["key_matches"],route.route,route.priority,1 if route.deep_analysis else 0,
            json.dumps(raw,separators=(",",":"))))
     return {"chain":chain,"symbol":symbol,"control":control_state(pair),"challenger":state,
             "reason":reason,"pre":pre_r.stage,"persistence":f"{pers.streak}/{pers.required}",
+            "persistence_failed":pers_diag["failed"],"persistence_key_matches":pers_diag["key_matches"],
+            "persistence_score":pers_diag["current_score"],
             "fast_route":route.route,"priority":round(route.priority,1)}
 
 def cycle(db):
