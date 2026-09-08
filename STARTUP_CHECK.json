@@ -1,0 +1,17 @@
+{
+  "stage": "local_process_startup_only",
+  "utc": "2026-09-08T03:33:24.296881+00:00",
+  "cloud_deployment": false,
+  "checks": {
+    "real_trading_mode_rejected": true,
+    "weak_dashboard_password_rejected": true,
+    "real_process_health_endpoint": true,
+    "missing_volume_blocks_paper_orders": true,
+    "graceful_shutdown": true
+  },
+  "logs": [
+    "2026-09-08 03:33:26,208 INFO {\"event\": \"APPLICATION_STARTED\", \"version\": \"paper-baseline-1.0.0\", \"mode\": \"PAPER_ONLY\", \"storage_ready\": false}",
+    "2026-09-08 03:33:26,209 WARNING {\"event\": \"SCAN_PAUSED\", \"error\": \"ValueError: Persistent volume missing: all paper orders paused; no orders\"}"
+  ],
+  "passed": true
+}

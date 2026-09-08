@@ -1,0 +1,42 @@
+test_bad_ohlc_bounds_rejected (test_paperlab.DataTests.test_bad_ohlc_bounds_rejected) ... ok
+test_crossed_quote_rejected (test_paperlab.DataTests.test_crossed_quote_rejected) ... ok
+test_directory_alone_is_not_persistent_railway_storage (test_paperlab.DataTests.test_directory_alone_is_not_persistent_railway_storage) ... ok
+test_future_quote_rejected (test_paperlab.DataTests.test_future_quote_rejected) ... ok
+test_invalid_config_rejected (test_paperlab.DataTests.test_invalid_config_rejected) ... ok
+test_latest_quote_wins_when_timestamp_is_tied (test_paperlab.DataTests.test_latest_quote_wins_when_timestamp_is_tied) ... ok
+test_live_order_endpoints_prohibited (test_paperlab.DataTests.test_live_order_endpoints_prohibited) ... ok
+test_missing_candle_rejected (test_paperlab.DataTests.test_missing_candle_rejected) ... ok
+test_no_recent_spread_rejected (test_paperlab.DataTests.test_no_recent_spread_rejected) ... ok
+test_nonfinite_price_rejected (test_paperlab.DataTests.test_nonfinite_price_rejected) ... ok
+test_unclosed_candle_rejected (test_paperlab.DataTests.test_unclosed_candle_rejected) ... ok
+test_uncommitted_candle_is_excluded (test_paperlab.DataTests.test_uncommitted_candle_is_excluded) ... ok
+test_dashboard_authenticated (test_paperlab.HTTPTests.test_dashboard_authenticated) ... ok
+test_dashboard_denies_anonymous_request (test_paperlab.HTTPTests.test_dashboard_denies_anonymous_request) ... ok
+test_health_identifies_actual_application (test_paperlab.HTTPTests.test_health_identifies_actual_application) ... ok
+test_no_order_mutation_route (test_paperlab.HTTPTests.test_no_order_mutation_route) ... ok
+test_not_ready_before_successful_scan (test_paperlab.HTTPTests.test_not_ready_before_successful_scan) ... ok
+test_valid_scan_does_not_mask_subsequent_failure (test_paperlab.HTTPTests.test_valid_scan_does_not_mask_subsequent_failure) ... ok
+test_benchmark_includes_same_cost_model (test_paperlab.LedgerTests.test_benchmark_includes_same_cost_model) ... ok
+test_buy_records_fees_and_conservative_equity (test_paperlab.LedgerTests.test_buy_records_fees_and_conservative_equity) ... ok
+test_candle_time_cannot_move_backwards (test_paperlab.LedgerTests.test_candle_time_cannot_move_backwards) ... ok
+test_config_change_refuses_silent_history_reset (test_paperlab.LedgerTests.test_config_change_refuses_silent_history_reset) ... ok
+test_csv_has_all_trade_rows (test_paperlab.LedgerTests.test_csv_has_all_trade_rows) ... ok
+test_drawdown_halt_persists_across_restart (test_paperlab.LedgerTests.test_drawdown_halt_persists_across_restart) ... ok
+test_error_is_logged_without_changing_cash (test_paperlab.LedgerTests.test_error_is_logged_without_changing_cash) ... ok
+test_incomplete_batch_rejected_without_order (test_paperlab.LedgerTests.test_incomplete_batch_rejected_without_order) ... ok
+test_initial_capital_and_no_trades (test_paperlab.LedgerTests.test_initial_capital_and_no_trades) ... ok
+test_new_closed_bar_trend_exit (test_paperlab.LedgerTests.test_new_closed_bar_trend_exit) ... ok
+test_no_buy_without_signal (test_paperlab.LedgerTests.test_no_buy_without_signal) ... ok
+test_no_same_bar_reentry_after_stop (test_paperlab.LedgerTests.test_no_same_bar_reentry_after_stop) ... ok
+test_restart_preserves_ledger_and_idempotency (test_paperlab.LedgerTests.test_restart_preserves_ledger_and_idempotency) ... ok
+test_same_bar_is_idempotent (test_paperlab.LedgerTests.test_same_bar_is_idempotent) ... ok
+test_stale_quote_rejected_without_order (test_paperlab.LedgerTests.test_stale_quote_rejected_without_order) ... ok
+test_stop_loss_and_net_realized_pnl (test_paperlab.LedgerTests.test_stop_loss_and_net_realized_pnl) ... ok
+test_symbol_mismatch_rejected (test_paperlab.LedgerTests.test_symbol_mismatch_rejected) ... ok
+test_take_profit (test_paperlab.LedgerTests.test_take_profit) ... ok
+test_transaction_rolls_back_partial_orders (test_paperlab.LedgerTests.test_transaction_rolls_back_partial_orders) ... ok
+
+----------------------------------------------------------------------
+Ran 37 tests in 3.197s
+
+OK

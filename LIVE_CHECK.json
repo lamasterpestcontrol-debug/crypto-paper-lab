@@ -1,0 +1,26 @@
+{
+  "stage": "local_one_shot_public_market_check",
+  "utc": "2026-09-08T03:31:21.776606+00:00",
+  "python": "3.13.5",
+  "railway_deployed": false,
+  "uses_real_funds": false,
+  "checks": {
+    "ETH": {
+      "passed": false,
+      "error_type": "URLError",
+      "error": "<urlopen error [Errno -3] Temporary failure in name resolution>"
+    },
+    "BTC": {
+      "passed": false,
+      "error_type": "URLError",
+      "error": "<urlopen error [Errno -3] Temporary failure in name resolution>"
+    },
+    "XRP": {
+      "passed": false,
+      "error_type": "URLError",
+      "error": "<urlopen error [Errno -3] Temporary failure in name resolution>"
+    }
+  },
+  "ledger_cycle_passed": false,
+  "note": "Live data check incomplete; deterministic tests do not prove external network connectivity. No fabricated replacement market data was used."
+}
