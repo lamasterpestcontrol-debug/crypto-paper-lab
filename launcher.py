@@ -1,23 +1,21 @@
-"""Launch live discovery and low-priority historical collector in one Railway service."""
+"""Launch discovery, historical collector, and shadow A/B evaluator in one Railway service."""
 from __future__ import annotations
-import os
-import signal
-import subprocess
-import sys
-import time
+import subprocess, sys
+
+def _stop(p):
+    if p and p.poll() is None:
+        p.terminate()
+        try: p.wait(timeout=15)
+        except subprocess.TimeoutExpired: p.kill()
 
 def main():
-    hist = subprocess.Popen([sys.executable, "-u", "history_replay.py", "--loop"])
+    hist=subprocess.Popen([sys.executable,"-u","history_replay.py","--loop"])
+    ab=subprocess.Popen([sys.executable,"-u","shadow_ab.py"])
     try:
         import discovery
         discovery.main()
     finally:
-        if hist.poll() is None:
-            hist.terminate()
-            try:
-                hist.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                hist.kill()
+        _stop(ab); _stop(hist)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

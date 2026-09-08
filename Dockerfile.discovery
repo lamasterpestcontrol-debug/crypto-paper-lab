@@ -1,7 +1,9 @@
-# history-replay-v0.2
+# history-replay + strategy-shadow-ab
 FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-COPY discovery.py test_discovery.py history_replay.py test_history_replay.py launcher.py ./
-RUN python -m unittest -v test_discovery test_history_replay
+COPY discovery.py test_discovery.py history_replay.py test_history_replay.py launcher.py \
+     strategy_v03.py test_strategy_v03.py strategy_v04.py test_strategy_v04.py \
+     shadow_ab.py test_shadow_ab.py ./
+RUN python -m unittest -v test_discovery test_history_replay test_strategy_v03 test_strategy_v04 test_shadow_ab
 CMD ["python", "-u", "launcher.py"]
