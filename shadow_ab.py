@@ -8,17 +8,21 @@ for CONTROL vs CHALLENGER (strategy v0.3 + v0.4) into SQLite.
 This isolates the experiment so production paper behavior is preserved.
 """
 from __future__ import annotations
-import json, os, sqlite3, time, urllib.request, urllib.parse
+import json, math, os, sqlite3, time, urllib.request, urllib.parse
+from collections import Counter
 from pathlib import Path
 from typing import Any
-from strategy_v03 import MarketSnapshot, build_decision
+from strategy_v03 import (MarketSnapshot, build_decision, exit_first_ok,
+                          data_freshness_ok, pullback_state)
 from strategy_v04 import estimate_slippage, classify_regime, RegimeInput, regime_position_multiplier
 from strategy_v05 import Evidence, classify as prediscovery_classify
 from strategy_v06 import SignalPoint, persistence_check
 from strategy_v07 import FastInput, fast_route
 
 DEX="https://api.dexscreener.com"
-UA="crypto-paper-lab-shadow-ab/0.1"
+UA="crypto-paper-lab-shadow-ab/0.2"
+DIAG_VERSION="persistence-diag-0.2.0"
+EVM_CHAINS={"ethereum","base","bsc","arbitrum","polygon"}
 SUPPORTED={"solana","ethereum","base","bsc","arbitrum","polygon"}
 
 def get_json(path:str)->Any:
@@ -28,9 +32,28 @@ def get_json(path:str)->Any:
         if len(raw)>3_000_000: raise ValueError("oversize")
     return json.loads(raw)
 
-def num(x,d=0.0):
-    try:return float(x)
-    except Exception:return d
+def num(x, d=0.0):
+    try:
+        value=float(x)
+        return value if math.isfinite(value) else d
+    except (TypeError, ValueError, OverflowError):
+        return d
+
+def emit(event, **fields):
+    print(json.dumps({"event": event, "diag_version": DIAG_VERSION, **fields},
+                     separators=(",", ":"), allow_nan=False), flush=True)
+
+def canonical_key(chain, address):
+    chain=str(chain).strip().lower()
+    address=str(address).strip()
+    if chain in EVM_CHAINS:
+        address=address.lower()
+    return chain,address
+
+def key_clause(chain):
+    # Collation is selected from a fixed allowlist, never user-controlled SQL.
+    return "chain=? AND address=? COLLATE NOCASE" if chain in EVM_CHAINS else "chain=? AND address=?"
+
 
 def dbopen(path:Path):
     db=sqlite3.connect(path,timeout=30)
@@ -92,25 +115,54 @@ def dbopen(path:Path):
     db.commit()
     return db
 
-def latest_prev(db,chain,address):
-    return db.execute("""SELECT ts,price,liquidity,volume_h1,volume_h24,buys_h1,sells_h1
-      FROM strategy_ab_observations WHERE chain=? AND address=? ORDER BY id DESC LIMIT 1""",
-      (chain,address)).fetchone()
+def latest_prev(db, chain, address, now=None):
+    chain,address=canonical_key(chain,address)
+    cutoff=time.time() if now is None else float(now)
+    return db.execute(f"""SELECT ts,price,liquidity,volume_h1,volume_h24,buys_h1,sells_h1
+      FROM strategy_ab_observations WHERE {key_clause(chain)} AND ts<?
+      ORDER BY ts DESC,id DESC LIMIT 1""", (chain,address,cutoff)).fetchone()
+
+def price_anchors(db, chain, address, now, current_price):
+    chain,address=canonical_key(chain,address)
+    where=key_clause(chain)+" AND ts<? AND price>0"
+    first=db.execute(f"SELECT price FROM strategy_ab_observations WHERE {where} ORDER BY ts,id LIMIT 1",
+                     (chain,address,now)).fetchone()
+    peak=db.execute(f"SELECT MAX(price) FROM strategy_ab_observations WHERE {where}",
+                    (chain,address,now)).fetchone()
+    return (num(first[0],current_price) if first else current_price,
+            max(current_price,num(peak[0],current_price) if peak else current_price))
+
 
 def pair_for(chain,address):
+    chain,address=canonical_key(chain,address)
     raw=get_json(f"/token-pairs/v1/{chain}/{address}")
     if not isinstance(raw,list): return None
     matches=[]
     for p in raw:
         if not isinstance(p,dict): continue
         base=p.get("baseToken") or {}
-        if str(base.get("address","")).lower()!=address.lower(): continue
+        if canonical_key(chain,base.get("address",""))[1]!=address: continue
         if not p.get("priceUsd"): continue
         matches.append(p)
     if not matches:return None
     return max(matches,key=lambda p:num((p.get("liquidity") or {}).get("usd")))
 
 def mk_snapshot(pair,ts):
+    # Invalid numeric inputs are not silently converted into a favorable signal.
+    fields={"priceUsd":pair.get("priceUsd"),
+            "liquidity":(pair.get("liquidity") or {}).get("usd"),
+            "volume_h1":(pair.get("volume") or {}).get("h1"),
+            "volume_h24":(pair.get("volume") or {}).get("h24"),
+            "buys_h1":((pair.get("txns") or {}).get("h1") or {}).get("buys"),
+            "sells_h1":((pair.get("txns") or {}).get("h1") or {}).get("sells"),
+            "price_change_h1":(pair.get("priceChange") or {}).get("h1")}
+    for name,value in fields.items():
+        if value is None and name!="priceUsd": continue
+        numeric=num(value,float("nan"))
+        if (not math.isfinite(numeric) or
+            (name!="price_change_h1" and numeric<0) or
+            (name=="priceUsd" and numeric<=0)):
+            raise ValueError("invalid market field: "+name)
     h1=(pair.get("txns") or {}).get("h1") or {}
     vol=pair.get("volume") or {}
     pc=pair.get("priceChange") or {}
@@ -172,36 +224,84 @@ def prediscovery_from_pair(pair, now):
     )
     return e,prediscovery_classify(e)
 
-def persistence_for_token(db,chain,address,now,current_score,risk_pass,exit_pass,liq_pass,return_diag=False):
-    rows=db.execute("""SELECT ts,challenger_score,challenger_state
-        FROM strategy_ab_observations
-        WHERE chain=? AND address=? ORDER BY id DESC LIMIT 5""",(chain,address)).fetchall()
-    pts=[]
-    for r in reversed(rows):
-        pts.append(SignalPoint(
-            ts=r["ts"],
-            score=float(r["challenger_score"] or 0),
-            risk_pass=(r["challenger_state"]!="REJECT"),
-            exit_pass=(r["challenger_state"]!="REJECT"),
-            liquidity_pass=(r["challenger_state"]!="REJECT"),
-        ))
-    score=float(current_score or 0)
-    pts.append(SignalPoint(now,score,risk_pass,exit_pass,liq_pass))
-    result=persistence_check(pts,required=3,min_score=1.0)
+def _point_failures(score, risk, exit_ok, liquidity):
     failed=[]
-    if score < 1.0: failed.append("SCORE_LT_1")
-    if not risk_pass: failed.append("RISK_FAIL")
-    if not exit_pass: failed.append("EXIT_FAIL")
-    if not liq_pass: failed.append("LIQUIDITY_FAIL")
-    diag={
-        "key_matches":len(rows),
-        "current_score":round(score,6),
-        "risk_pass":bool(risk_pass),
-        "exit_pass":bool(exit_pass),
-        "liquidity_pass":bool(liq_pass),
-        "failed":"|".join(failed) if failed else "NONE",
-    }
+    if not math.isfinite(score):
+        failed.append("SCORE_INVALID")
+    elif score < 1.0:
+        failed.append("SCORE_LT_1")
+    if not risk: failed.append("RISK_FAIL")
+    if not exit_ok: failed.append("EXIT_FAIL")
+    if not liquidity: failed.append("LIQUIDITY_FAIL")
+    return failed
+
+def _history_point(row):
+    # Prefer the actual three gates saved with the observation, not REJECT as a proxy.
+    raw=row["raw_json"]
+    source="LEGACY_STATE_PROXY"
+    diag=None
+    if raw:
+        try:
+            parsed=json.loads(raw)
+            diag=parsed.get("persistence_diag") if isinstance(parsed,dict) else None
+        except (ValueError,TypeError):
+            diag={}
+    keys=("risk_pass","exit_pass","liquidity_pass")
+    if isinstance(diag,dict) and all(type(diag.get(k)) is bool for k in keys):
+        gates=tuple(diag[k] for k in keys)
+        source="PERSISTED_GATES"
+    elif diag is not None:
+        gates=(False,False,False)
+        source="INVALID_HISTORY_DIAGNOSTICS"
+    else:
+        # Compatibility with pre-diagnostic rows; never infer pass for an unknown state.
+        allowed=row["challenger_state"] in ("WATCH","ENTER")
+        gates=(allowed,allowed,allowed)
+    score=num(row["challenger_score"],float("nan"))
+    return SignalPoint(row["ts"],score,*gates),source
+
+def persistence_for_token(db,chain,address,now,current_score,risk_pass,exit_pass,liq_pass,return_diag=False):
+    chain,address=canonical_key(chain,address)
+    now=float(now)
+    if not math.isfinite(now):
+        raise ValueError("non-finite observation timestamp")
+    # Exclude future/current observations. A duplicated timestamp is not a new round.
+    raw_rows=db.execute(f"""SELECT ts,challenger_score,challenger_state,raw_json
+        FROM strategy_ab_observations WHERE {key_clause(chain)} AND ts<?
+        ORDER BY ts DESC,id DESC LIMIT 25""",(chain,address,now)).fetchall()
+    seen=set();rows=[]
+    for row in raw_rows:
+        if row["ts"] not in seen:
+            rows.append(row);seen.add(row["ts"])
+            if len(rows)==5: break
+    pts=[];sources=[]
+    for row in reversed(rows):
+        point,source=_history_point(row)
+        pts.append(point);sources.append(source)
+    score=num(current_score,float("nan"))
+    gates=(risk_pass is True,exit_pass is True,liq_pass is True)
+    # The required count and score threshold are unchanged.
+    checked_score=score if math.isfinite(score) else float("-inf")
+    checked_pts=[SignalPoint(p.ts,p.score if math.isfinite(p.score) else float("-inf"),
+                             p.risk_pass,p.exit_pass,p.liquidity_pass) for p in pts]
+    result=persistence_check(checked_pts+[SignalPoint(now,checked_score,*gates)],required=3,min_score=1.0)
+    failed=_point_failures(score,*gates)
+    history_break="NONE"
+    if not failed and not result.confirmed:
+        for point in reversed(pts):
+            failures=_point_failures(point.score,point.risk_pass,point.exit_pass,point.liquidity_pass)
+            if failures:
+                history_break="|".join(failures);break
+        if history_break=="NONE": history_break="INSUFFICIENT_PRIOR_ROUNDS"
+    diag={"version":DIAG_VERSION,"key_matches":len(rows),"history_limit":5,
+          "current_score":round(score,6) if math.isfinite(score) else None,
+          "risk_pass":gates[0],"exit_pass":gates[1],"liquidity_pass":gates[2],
+          "failed":"|".join(failed) if failed else "NONE",
+          "history_break_reason":history_break,"history_gate_sources":dict(Counter(sources)),
+          "key":{"chain":chain,"address":address},
+          "key_status":"PRIOR_HISTORY_FOUND" if rows else "NO_PRIOR_HISTORY"}
     return (result,diag) if return_diag else result
+
 
 
 def fast_route_from_pair(pair, now):
@@ -221,16 +321,14 @@ def fast_route_from_pair(pair, now):
     return fast_route(x)
 
 def evaluate_one(db,chain,address,symbol,pair,now):
+    chain,address=canonical_key(chain,address)
     cur=mk_snapshot(pair,now)
     route=fast_route_from_pair(pair,now)
-    prev=mk_prev(latest_prev(db,chain,address))
-    first= db.execute("""SELECT price,MAX(price) FROM strategy_ab_observations
-      WHERE chain=? AND address=?""",(chain,address)).fetchone()
-    first_price=(first[0] if first and first[0] else cur.price)
-    high=(first[1] if first and first[1] else cur.price)
-    high=max(high or 0,cur.price)
+    prev=mk_prev(latest_prev(db,chain,address,now))
+    first_price,high=price_anchors(db,chain,address,now,cur.price)
     invalidation=max(cur.price*0.70, first_price*0.70) if cur.price>0 else 0
     intended=100.0
+    exit_intended=intended
     d=build_decision(cur,prev,intended,first_price,high,invalidation,now)
     regime=synthetic_regime()
     intended*=regime_position_multiplier(regime)
@@ -240,13 +338,24 @@ def evaluate_one(db,chain,address,symbol,pair,now):
     if not slip.pass_check:
         state="REJECT"; reason="SLIPPAGE_TOO_HIGH"
     pre_e,pre_r=prediscovery_from_pair(pair,now)
+    # Independent strategy gates. These are NOT a contract/wallet safety audit.
+    size_exit_ok,_=exit_first_ok(cur.liquidity,exit_intended)
+    pstate=pullback_state(first_price,cur.price,high,invalidation)
+    risk_ok=(data_freshness_ok(now,cur.social_ts,cur.holder_ts)
+             and pstate!="EXPIRE"
+             and not (d.state=="REJECT" and d.reason!="EXIT_TOO_THIN"))
+    exit_ok=bool(size_exit_ok and slip.pass_check)
     pers,pers_diag=persistence_for_token(
         db,chain,address,now,d.score,
-        risk_pass=(state!="REJECT"),
-        exit_pass=slip.pass_check,
-        liq_pass=(cur.liquidity>0),
+        risk_pass=bool(risk_ok),exit_pass=exit_ok,liq_pass=(cur.liquidity>0),
         return_diag=True,
     )
+    pers_diag.update({"gate_scope":"STRATEGY_PROXY_NOT_CONTRACT_AUDIT",
+                     "score_source":"strategy_v03_decision_score",
+                     "score_reason":d.reason,
+                     "vbp_strength":num((d.audit or {}).get("vbp_strength")),
+                     "exit_size_pass":bool(size_exit_ok),"slippage_pass":bool(slip.pass_check),
+                     "first_seen_price":first_price,"local_high_price":high})
     raw={
         "audit":d.audit,
         "slippage":slip.__dict__,
@@ -270,38 +379,51 @@ def evaluate_one(db,chain,address,symbol,pair,now):
            pre_r.stage,pre_r.score,pers.streak,pers.required,1 if pers.confirmed else 0,
            pers_diag["failed"],pers_diag["key_matches"],route.route,route.priority,1 if route.deep_analysis else 0,
            json.dumps(raw,separators=(",",":"))))
-    return {"chain":chain,"symbol":symbol,"control":control_state(pair),"challenger":state,
+    return {"chain":chain,"address":address,"symbol":symbol,"diag_version":DIAG_VERSION,"control":control_state(pair),"challenger":state,
             "reason":reason,"pre":pre_r.stage,"persistence":f"{pers.streak}/{pers.required}",
             "persistence_failed":pers_diag["failed"],"persistence_key_matches":pers_diag["key_matches"],
             "persistence_score":pers_diag["current_score"],
+            "persistence_confirmed":pers.confirmed,
+            "persistence_history_break":pers_diag["history_break_reason"],
+            "persistence_gate_scope":pers_diag["gate_scope"],
+            "score_source":pers_diag["score_source"],
+            "vbp_strength":pers_diag["vbp_strength"],
             "fast_route":route.route,"priority":round(route.priority,1)}
 
 def cycle(db):
     now=time.time()
     profiles=get_json("/token-profiles/latest/v1")
-    if not isinstance(profiles,list): return {"observed":0}
-    n=0; decisions=[]
+    if not isinstance(profiles,list): raise ValueError("profile feed is not a list")
+    n=0; decisions=[]; errors=0; seen=set()
     for p in profiles[:50]:
         if not isinstance(p,dict):continue
         chain=str(p.get("chainId") or "").lower()
         addr=str(p.get("tokenAddress") or "")
+        chain,addr=canonical_key(chain,addr)
         if chain not in SUPPORTED or len(addr)<20: continue
+        if (chain,addr) in seen: continue
+        seen.add((chain,addr))
         try:
             pair=pair_for(chain,addr)
             if not pair:continue
             symbol=str((pair.get("baseToken") or {}).get("symbol") or "?")
-            decisions.append(evaluate_one(db,chain,addr,symbol,pair,now))
+            decision=evaluate_one(db,chain,addr,symbol,pair,now)
+            decisions.append(decision)
+            emit("STRATEGY_AB_OBSERVATION",**decision)
             n+=1
             if n>=20:break
             time.sleep(.25)
-        except Exception:
+        except Exception as exc:
+            errors+=1
+            emit("STRATEGY_AB_TOKEN_ERROR",chain=chain,address=addr,error_type=type(exc).__name__,error=str(exc)[:160])
             continue
     with db:
         db.execute("INSERT OR REPLACE INTO strategy_ab_meta(k,v) VALUES('last_cycle',?)",
                    (json.dumps({"ts":now,"observed":n},separators=(",",":")),))
-    print(json.dumps({"event":"STRATEGY_AB_CYCLE_OK","observed":n,"sample":decisions[:3]},
-                     separators=(",",":")),flush=True)
-    return {"observed":n}
+    failures=Counter(reason for d in decisions for reason in d["persistence_failed"].split("|") if reason!="NONE")
+    summary={"observed":n,"errors":errors,"failure_counts":dict(failures),"sample":decisions[:3]}
+    emit("STRATEGY_AB_CYCLE_DEGRADED" if errors else "STRATEGY_AB_CYCLE_OK",**summary)
+    return summary
 
 def main():
     data=Path(os.getenv("DATA_DIR","/data" if os.getenv("RAILWAY_ENVIRONMENT_ID") else "./discovery-data"))

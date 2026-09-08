@@ -4,13 +4,13 @@ Collects REAL public GeckoTerminal pool catalog + daily OHLCV into the existing
 /data/discovery.sqlite3. No wallet access and no live trading capability.
 """
 from __future__ import annotations
-import argparse, json, os, random, sqlite3, time, urllib.parse, urllib.request
+import argparse, json, math, os, random, sqlite3, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 GT="https://api.geckoterminal.com/api/v2"
-VERSION="history-replay-0.2.0"
+VERSION="history-replay-0.2.1"
 NETWORKS=("solana","eth","base","bsc","arbitrum","polygon_pos")
 MIN_CALL_INTERVAL=max(7.5,float(os.getenv("HISTORY_MIN_CALL_INTERVAL","7.5")))
 UA="crypto-paper-lab-history/0.2"
@@ -49,18 +49,29 @@ def db_connect(path:Path)->sqlite3.Connection:
     CREATE INDEX IF NOT EXISTS idx_history_catalog_pool ON history_pool_catalog(network,pool_address);
     CREATE INDEX IF NOT EXISTS idx_history_ohlcv_pool ON history_ohlcv(network,pool_address,timeframe,ts);
     """)
+    cols={row[1] for row in db.execute("PRAGMA table_info(history_backfill_state)")}
+    for name,kind in (("consecutive_errors","INTEGER NOT NULL DEFAULT 0"),
+                      ("retry_after","REAL NOT NULL DEFAULT 0")):
+        if name not in cols:
+            db.execute(f"ALTER TABLE history_backfill_state ADD COLUMN {name} {kind}")
     db.commit(); return db
 
 def log_job(db,job,status,detail):
     with db: db.execute("INSERT INTO history_jobs(ts,job,status,detail) VALUES(?,?,?,?)",
                         (time.time(),job,status,json.dumps(detail,allow_nan=False,separators=(",",":"))))
+    if status=="ERROR":
+        print(json.dumps({"event":"HISTORY_JOB_ERROR","version":VERSION,"job":job,"detail":detail},
+                         allow_nan=False,separators=(",",":")),flush=True)
 
 def parse_pool(item):
     if not isinstance(item,dict): return None
     pid=str(item.get("id") or ""); attrs=item.get("attributes") or {}
     if "_" not in pid or not isinstance(attrs,dict): return None
-    network,address=pid.split("_",1)
+    # Network IDs may contain underscores (for example polygon_pos).
+    network,address=pid.rsplit("_",1)
     if not network or not address: return None
+    declared_address=attrs.get("address")
+    if declared_address and str(declared_address)!=address: return None
     return network,address,attrs.get("name"),attrs.get("pool_created_at"),json.dumps(item,separators=(",",":"))
 
 def catalog_response(db,body,cohort,now):
@@ -86,14 +97,25 @@ def catalog_response(db,body,cohort,now):
 def parse_ohlcv(body):
     try: rows=body["data"]["attributes"]["ohlcv_list"]
     except (KeyError,TypeError): raise ValueError("OHLCV response missing rows")
+    if not isinstance(rows,list):
+        raise ValueError("OHLCV rows must be a list, not an empty-page substitute")
     out=[]
-    if not isinstance(rows,list): return out
-    for r in rows:
-        if not isinstance(r,list) or len(r)<6: continue
-        ts=int(r[0]); vals=tuple(float(x) for x in r[1:6])
-        if ts<=0 or any(x<0 for x in vals): continue
-        out.append((ts,*vals))
+    for index,row in enumerate(rows):
+        try:
+            if not isinstance(row,list) or len(row)<6: raise ValueError("bad row shape")
+            timestamp=float(row[0]); values=tuple(float(x) for x in row[1:6])
+            if not math.isfinite(timestamp) or timestamp<=0 or not timestamp.is_integer():
+                raise ValueError("invalid timestamp")
+            if any(not math.isfinite(x) or x<0 for x in values): raise ValueError("invalid numeric value")
+            opening,high,low,close,volume=values
+            if high<max(opening,low,close) or low>min(opening,high,close):
+                raise ValueError("inconsistent OHLC bounds")
+        except (TypeError,ValueError,OverflowError) as exc:
+            # Reject the page, rather than advancing the cursor over invalid/missing data.
+            raise ValueError(f"invalid OHLCV row {index}: {exc}") from exc
+        out.append((int(timestamp),*values))
     return out
+
 
 def save_ohlcv(db,network,pool,timeframe,rows):
     if timeframe != "day":
@@ -114,7 +136,9 @@ def status(db):
       MIN(ts),MAX(ts) FROM history_ohlcv""").fetchone()
     jobs,ok,err=db.execute("SELECT COUNT(*),SUM(status='OK'),SUM(status='ERROR') FROM history_jobs").fetchone()
     pending=db.execute("SELECT COUNT(*) FROM history_backfill_state WHERE done=0").fetchone()[0]
-    return {"event":"HISTORY_STATUS","version":VERSION,"catalog_pools":pools,"ohlcv_rows":bars,
+    suspect=db.execute("SELECT COUNT(*) FROM history_backfill_state WHERE done=1 AND last_error IS NOT NULL AND empty_pages<2").fetchone()[0]
+    retrying=db.execute("SELECT COUNT(*) FROM history_backfill_state WHERE done=0 AND retry_after>?",(time.time(),)).fetchone()[0]
+    return {"suspect_completed_pools":suspect,"retry_wait_pools":retrying,"event":"HISTORY_STATUS","version":VERSION,"catalog_pools":pools,"ohlcv_rows":bars,
       "ohlcv_pools":dp,"earliest_date":iso(lo),"latest_date":iso(hi),"jobs":jobs,
       "jobs_ok":ok or 0,"jobs_error":err or 0,"pending_pools":pending}
 
@@ -136,11 +160,11 @@ class Worker:
         log_job(self.db,"catalog_top_pools","OK",{"network":network,"page":page,"rows":n}); return n
     def target(self):
         # Round-robin by least recently attempted; empty/failed pools cannot monopolize the queue.
-        return self.db.execute("""SELECT s.network,s.pool_address,MIN(o.ts) earliest,s.attempts,s.empty_pages
+        return self.db.execute("""SELECT s.network,s.pool_address,MIN(o.ts) earliest,s.attempts,s.empty_pages,s.consecutive_errors
           FROM history_backfill_state s LEFT JOIN history_ohlcv o
           ON o.network=s.network AND o.pool_address=s.pool_address AND o.timeframe='day'
-          WHERE s.done=0 GROUP BY s.network,s.pool_address
-          ORDER BY COALESCE(s.last_attempt,0) ASC,s.attempts ASC LIMIT 1""").fetchone()
+          WHERE s.done=0 AND s.retry_after<=? GROUP BY s.network,s.pool_address
+          ORDER BY COALESCE(s.last_attempt,0) ASC,s.attempts ASC LIMIT 1""",(time.time(),)).fetchone()
     def backfill(self):
         t=self.target()
         if not t: return None
@@ -153,6 +177,14 @@ class Worker:
         if earliest: p["before_timestamp"]=int(earliest)
         try:
             rows=parse_ohlcv(self.call(f"/networks/{network}/pools/{pool}/ohlcv/day",p))
+            if any(row[0]>int(now) for row in rows):
+                raise ValueError("FUTURE_OHLCV_TIMESTAMP")
+            if earliest and rows:
+                # Some APIs return the boundary candle inclusively. It is not progress.
+                older=[row for row in rows if row[0]<earliest]
+                if not older:
+                    raise ValueError("NO_BACKFILL_PROGRESS: non-empty page contains no older candles")
+                rows=older
             inserted=save_ohlcv(self.db,network,pool,"day",rows)
             with self.db:
                 if rows:
@@ -162,14 +194,23 @@ class Worker:
                     self.db.execute("""UPDATE history_backfill_state SET empty_pages=empty_pages+1,
                       done=CASE WHEN empty_pages+1>=2 THEN 1 ELSE done END
                       WHERE network=? AND pool_address=?""",(network,pool))
+            with self.db:
+                self.db.execute("UPDATE history_backfill_state SET consecutive_errors=0,retry_after=0,last_error=NULL WHERE network=? AND pool_address=?",(network,pool))
             d={"network":network,"pool":pool,"rows":len(rows),"inserted":inserted,
                "earliest_before":earliest,"earliest_after":min((r[0] for r in rows),default=earliest)}
             log_job(self.db,"backfill_day_ohlcv","OK",d); return d
         except Exception as e:
+            failures=int(t["consecutive_errors"] or 0)+1
+            delay=min(3600.0,max(30.0,MIN_CALL_INTERVAL*2**min(failures,8)))
             with self.db:
                 self.db.execute("""UPDATE history_backfill_state SET last_error=?,
-                  done=CASE WHEN attempts>=5 THEN 1 ELSE done END WHERE network=? AND pool_address=?""",
-                  (f"{type(e).__name__}: {str(e)[:180]}",network,pool))
+                  consecutive_errors=?,retry_after=? WHERE network=? AND pool_address=?""",
+                  (f"{type(e).__name__}: {str(e)[:180]}",failures,time.time()+delay,network,pool))
+            # No exception may mark a pool complete. Only validated empty pages do that.
+            print(json.dumps({"event":"HISTORY_BACKFILL_RETRY","version":VERSION,
+                "network":network,"pool":pool,"error_type":type(e).__name__,
+                "error":str(e)[:180],"consecutive_errors":failures,"retry_delay_seconds":delay,
+                "done":False},separators=(",",":"),allow_nan=False),flush=True)
             raise
     def cycle(self,tick):
         try:
@@ -195,7 +236,10 @@ def main():
     data=Path(os.getenv("DATA_DIR","/data" if os.getenv("RAILWAY_ENVIRONMENT_ID") else "./discovery-data"))
     db=db_connect(data/"discovery.sqlite3"); log_job(db,"history_start","OK",{"version":VERSION,"mode":"REAL_DATA_NO_TRADING"})
     w=Worker(db)
-    if args.once: w.cycle(0)
-    else: w.loop()
+    try:
+        if args.once: w.cycle(0)
+        else: w.loop()
+    finally:
+        db.close()
 
 if __name__=="__main__": main()

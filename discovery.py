@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import signal
+import sys
 import sqlite3
 import threading
 import time
@@ -371,7 +372,7 @@ def make_handler(app:App):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO,stream=sys.stdout,format="%(asctime)s %(levelname)s %(message)s")
     if os.getenv("MODE","PAPER_ONLY")!="PAPER_ONLY": raise SystemExit("Only PAPER_ONLY supported")
     password=os.getenv("DASHBOARD_PASSWORD","")
     if len(password)<16 or ":" in password: raise SystemExit("Set DASHBOARD_PASSWORD to at least 16 chars without colon")

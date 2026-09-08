@@ -21,12 +21,13 @@ class Tests(unittest.TestCase):
         self.assertFalse(a.eligible)
     def test_paper_position_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
-            s=Store(Path(d)/"x.db"); now=1_000_000+24*3600*1000
+            s=Store(Path(d)/"x.db"); self.addCleanup(s.db.close); now=1_000_000+24*3600*1000
             a=assess({"description":"AI data infrastructure protocol","links":[{"url":"https://x"}]},pair(),now)
             self.assertTrue(s.maybe_open(a,now/1000))
             p2=pair(priceUsd="0.021")
             b=assess({"description":"AI data infrastructure protocol","links":[{"url":"https://x"}]},p2,now+1000)
             self.assertEqual(s.update_position(b,now/1000+1),"TAKE_+100%")
             snap=s.snapshot(); self.assertEqual(snap["closed"],1); self.assertGreater(snap["realized_pnl"],0)
+            s.db.close()
 
 if __name__=="__main__": unittest.main()
