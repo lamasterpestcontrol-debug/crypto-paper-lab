@@ -95,12 +95,14 @@ def parse_ohlcv(body):
         out.append((ts,*vals))
     return out
 
-def save_ohlcv(db,network,pool,rows):
+def save_ohlcv(db,network,pool,timeframe,rows):
+    if timeframe != "day":
+        raise ValueError("unsupported timeframe")
     with db:
         before=db.total_changes
         db.executemany("""INSERT OR IGNORE INTO history_ohlcv
-          (network,pool_address,timeframe,ts,open,high,low,close,volume) VALUES(?,?,'day',?,?,?,?,?,?)""",
-          [(network,pool,*r) for r in rows])
+          (network,pool_address,timeframe,ts,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?,?)""",
+          [(network,pool,timeframe,*r) for r in rows])
         return db.total_changes-before
 
 def iso(ts):
@@ -151,7 +153,7 @@ class Worker:
         if earliest: p["before_timestamp"]=int(earliest)
         try:
             rows=parse_ohlcv(self.call(f"/networks/{network}/pools/{pool}/ohlcv/day",p))
-            inserted=save_ohlcv(self.db,network,pool,rows)
+            inserted=save_ohlcv(self.db,network,pool,"day",rows)
             with self.db:
                 if rows:
                     self.db.execute("""UPDATE history_backfill_state SET last_success=?,empty_pages=0
