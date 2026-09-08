@@ -38,60 +38,26 @@ class T(unittest.TestCase):
             self.assertFalse(p.confirmed)
 
     def test_persistence_three_round_deterministic(self):
-        """Three-round deterministic persistence test with fixed timestamp and same chain/address."""
+        import json
         with tempfile.TemporaryDirectory() as td:
-            db_path=Path(td)/"x.sqlite3"
-            base_ts=1000000.0  # Fixed deterministic timestamp
-            chain="solana"
-            address="EPjFWaJQwKJrhrarjSuwwnTfnCH3PzC4XQDvDX5n7x3a"  # Fixed address (USDC-like)
-            
-            results=[]
-            
-            # Round 1: Initial observation
-            db=shadow_ab.dbopen(db_path)
-            db.execute("""INSERT INTO strategy_ab_observations(
-                ts,chain,address,challenger_state,challenger_score) VALUES(?,?,?,?,?)""",
-                (base_ts,"solana",address,"WATCH",2.0))
-            db.commit()
-            p1,d1=shadow_ab.persistence_for_token(db,chain,address,base_ts,2.0,True,True,True,return_diag=True)
-            db.close()
-            results.append({"round":1,"streak":p1.streak,"confirmed":p1.confirmed,"key_matches":d1.get("key_matches",0),"failed":d1.get("failed","NONE")})
-            self.assertEqual(p1.streak,1,"Round 1 streak must be 1")
-            self.assertFalse(p1.confirmed,"Round 1 confirmed must be False")
-            self.assertEqual(d1.get("key_matches",0),1,"Round 1 key_matches must be 1")
-            
-            # Round 2: Add second observation
-            db=sqlite3.connect(db_path)
-            db.execute("""INSERT INTO strategy_ab_observations(
-                ts,chain,address,challenger_state,challenger_score) VALUES(?,?,?,?,?)""",
-                (base_ts+60,chain,address,"WATCH",2.0))
-            db.commit()
-            db.close()
-            db=shadow_ab.dbopen(db_path)
-            p2,d2=shadow_ab.persistence_for_token(db,chain,address,base_ts+60,2.0,True,True,True,return_diag=True)
-            db.close()
-            results.append({"round":2,"streak":p2.streak,"confirmed":p2.confirmed,"key_matches":d2.get("key_matches",0),"failed":d2.get("failed","NONE")})
-            self.assertEqual(p2.streak,2,"Round 2 streak must be 2")
-            self.assertFalse(p2.confirmed,"Round 2 confirmed must be False")
-            self.assertEqual(d2.get("key_matches",0),2,"Round 2 key_matches must be 2")
-            
-            # Round 3: Add third observation (should trigger confirmed)
-            db=sqlite3.connect(db_path)
-            db.execute("""INSERT INTO strategy_ab_observations(
-                ts,chain,address,challenger_state,challenger_score) VALUES(?,?,?,?,?)""",
-                (base_ts+120,chain,address,"WATCH",2.0))
-            db.commit()
-            db.close()
-            db=shadow_ab.dbopen(db_path)
-            p3,d3=shadow_ab.persistence_for_token(db,chain,address,base_ts+120,2.0,True,True,True,return_diag=True)
-            db.close()
-            results.append({"round":3,"streak":p3.streak,"confirmed":p3.confirmed,"key_matches":d3.get("key_matches",0),"failed":d3.get("failed","NONE")})
-            self.assertEqual(p3.streak,3,"Round 3 streak must be 3")
-            self.assertTrue(p3.confirmed,"Round 3 confirmed must be True")
-            self.assertEqual(d3.get("key_matches",0),3,"Round 3 key_matches must be 3")
-            
-            # Emit compact test result
-            print("\nPERSISTENCE_THREE_ROUND_TEST_OK: "+json.dumps({"rounds":results,"status":"PASS"}))
+            path = Path(td) / 'three.sqlite3'
+            results = []
+            for i in range(3):
+                db = shadow_ab.dbopen(path)
+                try:
+                    now = 1700000000.0 + 60.0 * i
+                    p, d = shadow_ab.persistence_for_token(db, 'solana', 'same-token', now, 2.0, True, True, True, return_diag=True)
+                    self.assertEqual(p.required, 3)
+                    self.assertEqual(p.streak, i + 1)
+                    self.assertEqual(p.confirmed, i == 2)
+                    self.assertEqual(d['key_matches'], i)
+                    self.assertEqual(d['failed'], 'NONE')
+                    results.append({'round': i + 1, 'streak': p.streak, 'confirmed': p.confirmed, 'key_matches': d['key_matches']})
+                    db.execute('INSERT INTO strategy_ab_observations(ts,chain,address,challenger_state,challenger_score) VALUES(?,?,?,?,?)', (now, 'solana', 'same-token', 'WATCH', 2.0))
+                    db.commit()
+                finally:
+                    db.close()
+            print(json.dumps({'event':'PERSISTENCE_THREE_ROUND_TEST_OK','rounds':results}), flush=True)
 
     def test_persistence_negative_score_lt_1(self):
         """Negative case: score < 1 must fail and block confirmation."""
@@ -106,7 +72,7 @@ class T(unittest.TestCase):
         """Negative case: exit=False must block confirmation."""
         with tempfile.TemporaryDirectory() as td:
             db=shadow_ab.dbopen(Path(td)/"x.sqlite3")
-            p,d=shadow_ab.persistence_for_token(db,"solana","test-token",time.time(),2.0,False,True,True,return_diag=True)
+            p,d=shadow_ab.persistence_for_token(db,"solana","test-token",time.time(),2.0,True,False,True,return_diag=True)
             self.assertFalse(p.confirmed,"Confirmed must be False when exit=False")
             self.assertIn("EXIT_FAIL",d.get("failed",""),"Must report EXIT_FAIL when exit=False")
 
@@ -114,7 +80,7 @@ class T(unittest.TestCase):
         """Negative case: risk=False must block confirmation."""
         with tempfile.TemporaryDirectory() as td:
             db=shadow_ab.dbopen(Path(td)/"x.sqlite3")
-            p,d=shadow_ab.persistence_for_token(db,"solana","test-token",time.time(),2.0,True,False,True,return_diag=True)
+            p,d=shadow_ab.persistence_for_token(db,"solana","test-token",time.time(),2.0,False,True,True,return_diag=True)
             self.assertFalse(p.confirmed,"Confirmed must be False when risk=False")
             self.assertIn("RISK_FAIL",d.get("failed",""),"Must report RISK_FAIL when risk=False")
 
