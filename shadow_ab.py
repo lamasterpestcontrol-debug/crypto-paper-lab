@@ -15,6 +15,7 @@ from strategy_v03 import MarketSnapshot, build_decision
 from strategy_v04 import estimate_slippage, classify_regime, RegimeInput, regime_position_multiplier
 from strategy_v05 import Evidence, classify as prediscovery_classify
 from strategy_v06 import SignalPoint, persistence_check
+from strategy_v07 import FastInput, fast_route
 
 DEX="https://api.dexscreener.com"
 UA="crypto-paper-lab-shadow-ab/0.1"
@@ -59,6 +60,9 @@ def dbopen(path:Path):
       persistence_streak INTEGER,
       persistence_required INTEGER,
       persistence_confirmed INTEGER,
+      fast_route TEXT,
+      fast_priority REAL,
+      deep_analysis INTEGER,
       raw_json TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_ab_token_ts
@@ -75,6 +79,9 @@ def dbopen(path:Path):
         ("persistence_streak","INTEGER"),
         ("persistence_required","INTEGER"),
         ("persistence_confirmed","INTEGER"),
+        ("fast_route","TEXT"),
+        ("fast_priority","REAL"),
+        ("deep_analysis","INTEGER"),
     ]:
         if name not in cols:
             db.execute(f"ALTER TABLE strategy_ab_observations ADD COLUMN {name} {typ}")
@@ -177,8 +184,26 @@ def persistence_for_token(db,chain,address,now,current_score,risk_pass,exit_pass
     pts.append(SignalPoint(now,float(current_score or 0),risk_pass,exit_pass,liq_pass))
     return persistence_check(pts,required=3,min_score=1.0)
 
+
+def fast_route_from_pair(pair, now):
+    h1=(pair.get("txns") or {}).get("h1") or {}
+    liq=num((pair.get("liquidity") or {}).get("usd"))
+    volh1=num((pair.get("volume") or {}).get("h1"))
+    created=num(pair.get("pairCreatedAt"))
+    age_m=((now*1000-created)/60_000) if created>0 else 999999
+    x=FastInput(
+        liquidity_usd=liq,
+        volume_h1_usd=volh1,
+        buys_h1=int(num(h1.get("buys"))),
+        sells_h1=int(num(h1.get("sells"))),
+        age_minutes=age_m,
+        basic_risk_block=False,
+    )
+    return fast_route(x)
+
 def evaluate_one(db,chain,address,symbol,pair,now):
     cur=mk_snapshot(pair,now)
+    route=fast_route_from_pair(pair,now)
     prev=mk_prev(latest_prev(db,chain,address))
     first= db.execute("""SELECT price,MAX(price) FROM strategy_ab_observations
       WHERE chain=? AND address=?""",(chain,address)).fetchone()
@@ -208,21 +233,25 @@ def evaluate_one(db,chain,address,symbol,pair,now):
         "prediscovery":{"evidence":pre_e.__dict__,"result":pre_r.__dict__,
                         "note":"CURRENTLY_PROXY_INPUTS_ONLY_NOT_FULL_REAL_DATA"},
         "persistence":pers.__dict__,
+        "fast_route":route.__dict__,
         "mode":"SHADOW_ONLY",
     }
     with db:
         db.execute("""INSERT INTO strategy_ab_observations(
           ts,chain,address,symbol,price,liquidity,volume_h1,volume_h24,buys_h1,sells_h1,
           control_state,challenger_state,challenger_reason,challenger_score,max_safe_usd,regime,
-          prediscovery_stage,prediscovery_score,persistence_streak,persistence_required,persistence_confirmed,raw_json)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          prediscovery_stage,prediscovery_score,persistence_streak,persistence_required,persistence_confirmed,
+          fast_route,fast_priority,deep_analysis,raw_json)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (now,chain,address,symbol,cur.price,cur.liquidity,cur.volume_h1,cur.volume_h24,
            cur.buys_h1,cur.sells_h1,control_state(pair),state,reason,d.score,
            min(d.max_safe_usd,slip.max_safe_usd),regime,
            pre_r.stage,pre_r.score,pers.streak,pers.required,1 if pers.confirmed else 0,
+           route.route,route.priority,1 if route.deep_analysis else 0,
            json.dumps(raw,separators=(",",":"))))
     return {"chain":chain,"symbol":symbol,"control":control_state(pair),"challenger":state,
-            "reason":reason,"pre":pre_r.stage,"persistence":f"{pers.streak}/{pers.required}"}
+            "reason":reason,"pre":pre_r.stage,"persistence":f"{pers.streak}/{pers.required}",
+            "fast_route":route.route,"priority":round(route.priority,1)}
 
 def cycle(db):
     now=time.time()
