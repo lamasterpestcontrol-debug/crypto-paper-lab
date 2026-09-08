@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from strategy_v03 import MarketSnapshot, build_decision
 from strategy_v04 import estimate_slippage, classify_regime, RegimeInput, regime_position_multiplier
+from strategy_v05 import Evidence, classify as prediscovery_classify
+from strategy_v06 import SignalPoint, persistence_check
 
 DEX="https://api.dexscreener.com"
 UA="crypto-paper-lab-shadow-ab/0.1"
@@ -52,6 +54,11 @@ def dbopen(path:Path):
       challenger_score REAL,
       max_safe_usd REAL,
       regime TEXT,
+      prediscovery_stage TEXT,
+      prediscovery_score REAL,
+      persistence_streak INTEGER,
+      persistence_required INTEGER,
+      persistence_confirmed INTEGER,
       raw_json TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_ab_token_ts
@@ -60,6 +67,17 @@ def dbopen(path:Path):
       k TEXT PRIMARY KEY,v TEXT NOT NULL
     );
     """)
+    # Backward-compatible schema migrations for existing Railway volume.
+    cols={r[1] for r in db.execute("PRAGMA table_info(strategy_ab_observations)")}
+    for name,typ in [
+        ("prediscovery_stage","TEXT"),
+        ("prediscovery_score","REAL"),
+        ("persistence_streak","INTEGER"),
+        ("persistence_required","INTEGER"),
+        ("persistence_confirmed","INTEGER"),
+    ]:
+        if name not in cols:
+            db.execute(f"ALTER TABLE strategy_ab_observations ADD COLUMN {name} {typ}")
     db.commit()
     return db
 
@@ -114,6 +132,51 @@ def synthetic_regime():
     # Until BTC regime feed is wired, remain conservative and explicit.
     return "NEUTRAL"
 
+
+def prediscovery_from_pair(pair, now):
+    info=pair.get("info") or {}
+    websites=info.get("websites") or []
+    socials=info.get("socials") or []
+    h1=(pair.get("txns") or {}).get("h1") or {}
+    liq=num((pair.get("liquidity") or {}).get("usd"))
+    volh1=num((pair.get("volume") or {}).get("h1"))
+    created=num(pair.get("pairCreatedAt"))
+    age_h=((now*1000-created)/3_600_000) if created>0 else None
+    # These are conservative proxies from currently available public feed.
+    # They are explicitly not treated as real GitHub/product/on-chain identity verification.
+    e=Evidence(
+        ts=now,
+        github_activity=0.0,
+        product_live=.25 if websites else 0.0,
+        ecosystem_support=0.0,
+        contract_deployed=1.0,
+        first_pool=1.0 if liq>0 else 0.0,
+        onchain_adoption=min(1.0,volh1/50_000.0) if volh1>0 else 0.0,
+        social_early_growth=.25 if socials else 0.0,
+        catalyst=0.0,
+        official_identity=.5 if websites else .2,
+        independent_sources=1 + (1 if websites else 0),
+        paid_promo_risk=0.0,
+        age_hours=age_h,
+    )
+    return e,prediscovery_classify(e)
+
+def persistence_for_token(db,chain,address,now,current_score,risk_pass,exit_pass,liq_pass):
+    rows=db.execute("""SELECT ts,challenger_score,challenger_state
+        FROM strategy_ab_observations
+        WHERE chain=? AND address=? ORDER BY id DESC LIMIT 5""",(chain,address)).fetchall()
+    pts=[]
+    for r in reversed(rows):
+        pts.append(SignalPoint(
+            ts=r["ts"],
+            score=float(r["challenger_score"] or 0),
+            risk_pass=(r["challenger_state"]!="REJECT"),
+            exit_pass=(r["challenger_state"]!="REJECT"),
+            liquidity_pass=(r["challenger_state"]!="REJECT"),
+        ))
+    pts.append(SignalPoint(now,float(current_score or 0),risk_pass,exit_pass,liq_pass))
+    return persistence_check(pts,required=3,min_score=1.0)
+
 def evaluate_one(db,chain,address,symbol,pair,now):
     cur=mk_snapshot(pair,now)
     prev=mk_prev(latest_prev(db,chain,address))
@@ -132,16 +195,34 @@ def evaluate_one(db,chain,address,symbol,pair,now):
     reason=d.reason
     if not slip.pass_check:
         state="REJECT"; reason="SLIPPAGE_TOO_HIGH"
-    raw={"audit":d.audit,"slippage":slip.__dict__,"mode":"SHADOW_ONLY"}
+    pre_e,pre_r=prediscovery_from_pair(pair,now)
+    pers=persistence_for_token(
+        db,chain,address,now,d.score,
+        risk_pass=(state!="REJECT"),
+        exit_pass=slip.pass_check,
+        liq_pass=(cur.liquidity>0),
+    )
+    raw={
+        "audit":d.audit,
+        "slippage":slip.__dict__,
+        "prediscovery":{"evidence":pre_e.__dict__,"result":pre_r.__dict__,
+                        "note":"CURRENTLY_PROXY_INPUTS_ONLY_NOT_FULL_REAL_DATA"},
+        "persistence":pers.__dict__,
+        "mode":"SHADOW_ONLY",
+    }
     with db:
         db.execute("""INSERT INTO strategy_ab_observations(
           ts,chain,address,symbol,price,liquidity,volume_h1,volume_h24,buys_h1,sells_h1,
-          control_state,challenger_state,challenger_reason,challenger_score,max_safe_usd,regime,raw_json)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          control_state,challenger_state,challenger_reason,challenger_score,max_safe_usd,regime,
+          prediscovery_stage,prediscovery_score,persistence_streak,persistence_required,persistence_confirmed,raw_json)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (now,chain,address,symbol,cur.price,cur.liquidity,cur.volume_h1,cur.volume_h24,
            cur.buys_h1,cur.sells_h1,control_state(pair),state,reason,d.score,
-           min(d.max_safe_usd,slip.max_safe_usd),regime,json.dumps(raw,separators=(",",":"))))
-    return {"chain":chain,"symbol":symbol,"control":control_state(pair),"challenger":state,"reason":reason}
+           min(d.max_safe_usd,slip.max_safe_usd),regime,
+           pre_r.stage,pre_r.score,pers.streak,pers.required,1 if pers.confirmed else 0,
+           json.dumps(raw,separators=(",",":"))))
+    return {"chain":chain,"symbol":symbol,"control":control_state(pair),"challenger":state,
+            "reason":reason,"pre":pre_r.stage,"persistence":f"{pers.streak}/{pers.required}"}
 
 def cycle(db):
     now=time.time()
