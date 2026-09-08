@@ -258,17 +258,192 @@ class Store:
             self.db.execute("INSERT INTO scans(ts,status,body) VALUES(?,?,?)", (now,status,json.dumps(body,allow_nan=False)))
             self.db.execute("DELETE FROM scans WHERE id <= (SELECT COALESCE(MAX(id),0)-10080 FROM scans)")
 
+    def accounting_snapshot(self, now: float | None = None) -> dict[str, Any]:
+        """Read all retained positions; missing execution costs remain unknown.
+
+        This strategy is separate from shadow observations and paper-runner-v1.
+        A mark is a collector observation, not a verified executable exit quote.
+        """
+        now = time.time() if now is None else float(now)
+        if not D(str(now)).is_finite():
+            raise ValueError("Invalid accounting timestamp")
+        tolerance, zero = D("0.0001"), D("0")
+        totals = {k: zero for k in ("stored", "computed", "open_basis", "open_value", "open_pnl")}
+        counts = {k: 0 for k in ("total", "closed", "open", "invalid_status", "wins", "losses",
+                                  "breakeven", "reconciled_closed", "valid_closed", "marked_open")}
+        issues: dict[str, int] = {}
+        samples: list[dict[str, Any]] = []
+
+        def issue(kind: str, position_id: int) -> None:
+            issues[kind] = issues.get(kind, 0) + 1
+            if len(samples) < 20:
+                samples.append({"kind": kind, "position_id": position_id})
+
+        def value(raw: Any) -> Decimal | None:
+            try:
+                if raw is None or isinstance(raw, bool):
+                    return None
+                v = D(str(raw))
+                return v if v.is_finite() else None
+            except (ArithmeticError, ValueError, TypeError):
+                return None
+
+        # Pin one coherent read snapshot without committing a caller's transaction.
+        with self.lock:
+            self.db.execute("SAVEPOINT accounting_read")
+            try:
+                rows = self.db.execute("""SELECT p.*,c.current_price AS mark_price,
+                    c.last_seen AS mark_ts,c.liquidity AS mark_liquidity
+                    FROM positions p LEFT JOIN candidates c
+                    ON c.chain=p.chain AND c.address=p.address ORDER BY p.id""")
+                for r in rows:
+                    counts["total"] += 1
+                    pid = r["id"]
+                    if r["status"] not in ("OPEN", "CLOSED"):
+                        counts["invalid_status"] += 1
+                        issue("INVALID_POSITION_STATUS", pid)
+                        continue
+                    status = r["status"].lower()
+                    counts[status] += 1
+                    qty, entry, basis = (value(r[k]) for k in ("qty", "entry_price", "usd"))
+                    opened = value(r["opened_at"])
+                    valid = (qty is not None and qty > 0 and entry is not None and entry > 0
+                             and basis is not None and basis > 0 and opened is not None
+                             and 0 <= opened <= D(str(now)))
+                    if valid and abs(qty * entry - basis) > max(tolerance, basis * D("1e-8")):
+                        issue("ENTRY_BASIS_MISMATCH", pid)
+                        valid = False
+                    if not valid:
+                        issue("INVALID_ENTRY_LEDGER", pid)
+                    if status == "closed":
+                        stored, exit_price, closed = (value(r[k]) for k in ("pnl", "exit_price", "closed_at"))
+                        if stored is not None:
+                            totals["stored"] += stored
+                        valid = (valid and stored is not None and exit_price is not None
+                                 and exit_price > 0 and closed is not None
+                                 and opened <= closed <= D(str(now)))
+                        if not valid:
+                            issue("INVALID_CLOSED_LEDGER", pid)
+                            continue
+                        computed = qty * exit_price - basis
+                        totals["computed"] += computed
+                        counts["valid_closed"] += 1
+                        counts["wins" if computed > 0 else "losses" if computed < 0 else "breakeven"] += 1
+                        if abs(stored - computed) > max(tolerance, abs(computed) * D("1e-8")):
+                            issue("REALIZED_PNL_MISMATCH", pid)
+                        else:
+                            counts["reconciled_closed"] += 1
+                    else:
+                        if not valid:
+                            continue
+                        totals["open_basis"] += basis
+                        if r["closed_at"] is not None or r["exit_price"] is not None:
+                            issue("OPEN_POSITION_HAS_EXIT_FIELDS", pid)
+                            continue
+                        mark, stamp = value(r["mark_price"]), value(r["mark_ts"])
+                        if mark is None or mark <= 0 or stamp is None:
+                            issue("MISSING_OR_INVALID_OPEN_MARK", pid)
+                            continue
+                        if not opened <= stamp <= D(str(now)):
+                            issue("FUTURE_OR_PRE_ENTRY_MARK", pid)
+                            continue
+                        if D(str(now)) - stamp > 180:
+                            issue("STALE_OPEN_MARK", pid)
+                            continue
+                        liq = value(r["mark_liquidity"])
+                        if liq is None or liq <= 0:
+                            issue("NO_OBSERVED_EXIT_LIQUIDITY", pid)
+                            continue
+                        counts["marked_open"] += 1
+                        mark_value = qty * mark
+                        totals["open_value"] += mark_value
+                        totals["open_pnl"] += mark_value - basis
+
+                shadow = {"state": "NOT_PRESENT", "observations": 0,
+                          "confirmed_observations": 0, "enter_observations": 0,
+                          "executed_trades": None, "pnl_usd": None,
+                          "note": "OBSERVATIONS_ARE_NOT_TRADES; NO_EXECUTION_LINK_IN_THIS_LEDGER"}
+                has_shadow = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_ab_observations'").fetchone()
+                if has_shadow:
+                    cols = {r[1] for r in self.db.execute("PRAGMA table_info(strategy_ab_observations)")}
+                    if {"challenger_state", "persistence_confirmed"}.issubset(cols):
+                        row = self.db.execute("""SELECT COUNT(*),
+                          COALESCE(SUM(persistence_confirmed=1),0),
+                          COALESCE(SUM(challenger_state='ENTER'),0)
+                          FROM strategy_ab_observations""").fetchone()
+                        shadow.update(state="OBSERVATION_ONLY", observations=row[0],
+                                      confirmed_observations=row[1], enter_observations=row[2])
+                    else:
+                        shadow["state"] = "SCHEMA_INCOMPLETE"
+            finally:
+                self.db.execute("RELEASE accounting_read")
+
+        money = lambda v: format(v, "f")
+        closed_ok = counts["reconciled_closed"] == counts["closed"]
+        marks_ok = counts["marked_open"] == counts["open"]
+        all_gross_ok = closed_ok and marks_ok and counts["invalid_status"] == 0
+        return {
+            "accounting_version": "paper-scorecard-0.1.0", "as_of": now,
+            "strategy": "EARLY_TOKEN_CONTROL", "mode": "PAPER_ONLY",
+            "scope": "ALL_RETAINED_POSITIONS_NOT_DISPLAY_LIMIT",
+            "positions": counts["total"], "open": counts["open"], "closed": counts["closed"],
+            "invalid_status": counts["invalid_status"],
+            "gross_wins": counts["wins"], "gross_losses": counts["losses"],
+            "gross_breakeven": counts["breakeven"],
+            "gross_win_rate": counts["wins"]/counts["closed"] if counts["closed"] and closed_ok else None,
+            "closed_records_reconciled": counts["reconciled_closed"],
+            "closed_pnl_reconciled": closed_ok,
+            "gross_ledger_reconciled": closed_ok and counts["invalid_status"] == 0 and not any(
+                k in issues for k in ("INVALID_ENTRY_LEDGER", "ENTRY_BASIS_MISMATCH", "OPEN_POSITION_HAS_EXIT_FIELDS")),
+            "stored_realized_gross_partial_usd": money(totals["stored"]),
+            "computed_realized_gross_partial_usd": money(totals["computed"]),
+            "realized_gross_usd": money(totals["computed"]) if closed_ok else None,
+            "fresh_marked_open": counts["marked_open"], "open_mark_coverage_complete": marks_ok,
+            "open_cost_basis_valid_subset_usd": money(totals["open_basis"]),
+            "marked_open_value_valid_subset_usd": money(totals["open_value"]),
+            "unrealized_gross_valid_subset_usd": money(totals["open_pnl"]),
+            "unrealized_gross_usd": money(totals["open_pnl"]) if marks_ok else None,
+            "combined_gross_usd": money(totals["computed"]+totals["open_pnl"]) if all_gross_ok else None,
+            "mark_basis": "COLLECTOR_OBSERVATION_NOT_EXECUTABLE_EXIT_QUOTE",
+            "fees_usd": None, "slippage_usd": None, "gas_usd": None,
+            "realized_net_usd": None, "combined_net_usd": None,
+            "cost_accounting": "MISSING_NOT_ZERO", "fill_verification": "NOT_VERIFIED",
+            "equity_return_pct": None, "max_drawdown_pct": None,
+            "cash_reconciliation": "UNAVAILABLE_NO_INITIAL_CAPITAL_OR_CASH_FLOW_LEDGER",
+            "profitability_verified": False, "issue_counts": issues, "issue_samples": samples,
+            "shadow_ab": shadow,
+            "separate_runner": "BTC_ETH_XRP_IS_A_SEPARATE_DATABASE_DO_NOT_COMBINE",
+        }
+
+    def positions_csv_bytes(self) -> bytes:
+        """Export every position; disarm formulas in market-controlled text."""
+        def safe_cell(v: Any) -> Any:
+            if isinstance(v, str) and v.lstrip().startswith(("=", "+", "-", "@")):
+                return "'" + v
+            return v
+        with self.lock:
+            cur = self.db.execute("SELECT * FROM positions ORDER BY opened_at,id")
+            out = io.StringIO(); writer = csv.writer(out)
+            writer.writerow([d[0] for d in cur.description])
+            writer.writerows([safe_cell(v) for v in row] for row in cur)
+            return ("\ufeff" + out.getvalue()).encode("utf-8")
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             cands = [dict(r) for r in self.db.execute("SELECT * FROM candidates ORDER BY first_seen DESC LIMIT 100")]
             positions = [dict(r) for r in self.db.execute("SELECT * FROM positions ORDER BY opened_at DESC LIMIT 100")]
             scans = self.db.execute("SELECT COUNT(*),SUM(status!='OK') FROM scans").fetchone()
-            closed = [p for p in positions if p["status"] == "CLOSED"]
-            wins = sum(p["pnl"] > 0 for p in closed)
-            total_pnl = sum(p["pnl"] for p in closed)
+            accounting = self.accounting_snapshot()
+            wins = accounting["gross_wins"]
+            total_pnl = accounting["realized_gross_usd"]
+            # Retain legacy field, explicitly gross-only; invalid totals stay null.
+            legacy_pnl = num(total_pnl, None) if total_pnl is not None else None
             last = self.db.execute("SELECT ts,status,body FROM scans ORDER BY id DESC LIMIT 1").fetchone()
             return {"version":VERSION,"candidates":cands,"positions":positions,"scans":scans[0] or 0,
-                    "errors":scans[1] or 0,"closed":len(closed),"wins":wins,"realized_pnl":total_pnl,
+                    "errors":scans[1] or 0,"closed":accounting["closed"],"wins":wins,"realized_pnl":legacy_pnl,
+                    "accounting":accounting,"pnl_basis":"GROSS_BEFORE_UNRECORDED_COSTS",
+                    "scan_count_scope":"RETAINED_LOGS_NOT_LIFETIME",
+                    "positions_total":accounting["positions"],"positions_displayed":len(positions),
                     "last_scan":dict(last) if last else None}
 
     def csv_bytes(self) -> bytes:
@@ -345,8 +520,8 @@ class App:
         return s
 
 
-PAGE="""<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>早期实用型代币模拟扫描</title><style>body{font:17px system-ui;max-width:1100px;margin:20px auto;padding:0 16px;line-height:1.55}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:6px;border-bottom:1px solid #aaa;text-align:left}code{word-break:break-all}.ok{font-weight:700}</style><h1>早期实用型代币模拟扫描</h1><p><b>只用虚拟资金 · 无真实下单能力。</b> “实用型”仅表示公开资料出现用途证据，不等于项目已被验证或值得投资。</p><p id=s>读取中…</p><p><a href=/candidates.csv>导出累计候选 CSV</a></p><h2>虚拟仓位</h2><div id=p></div><h2>最近候选</h2><div id=c></div><script src=/app.js></script></html>"""
-SCRIPT="""const f=n=>Number(n||0).toLocaleString(undefined,{maximumFractionDigits:2});function table(rows,cols){if(!rows.length)return '暂无';let h='<table><tr>'+cols.map(x=>'<th>'+x[0]+'</th>').join('')+'</tr>';for(const r of rows)h+='<tr>'+cols.map(x=>'<td>'+String(x[1](r)??'')+'</td>').join('')+'</tr>';return h+'</table>'}async function load(){try{let r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let x=await r.json();document.getElementById('s').textContent=(x.ready?'扫描正常':'未就绪')+' | 扫描 '+x.scans+' | 异常 '+x.errors+' | 已平仓 '+x.closed+' | 胜 '+x.wins+' | 已实现模拟盈亏 $'+f(x.realized_pnl);document.getElementById('p').innerHTML=table(x.positions,[['币',r=>r.symbol],['链',r=>r.chain],['状态',r=>r.status],['投入$',r=>f(r.usd)],['入场',r=>r.entry_price],['退出',r=>r.exit_price||''],['盈亏$',r=>f(r.pnl)],['原因',r=>r.reason]]);document.getElementById('c').innerHTML=table(x.candidates.slice(0,50),[['币',r=>r.symbol],['链',r=>r.chain],['评分',r=>r.score],['市值',r=>'$'+f(r.market_cap)],['流动性',r=>'$'+f(r.liquidity)],['24h量',r=>'$'+f(r.volume24)],['首次价',r=>r.entry_price],['现价',r=>r.current_price],['最高涨幅',r=>f(r.max_return*100)+'%'],['用途证据',r=>r.evidence]]);}catch(e){document.getElementById('s').textContent='读取失败: '+e.message}}load();setInterval(load,60000);"""
+PAGE="""<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>早期实用型代币模拟扫描</title><style>body{font:17px system-ui;max-width:1100px;margin:20px auto;padding:0 16px;line-height:1.55}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:6px;border-bottom:1px solid #aaa;text-align:left}code{word-break:break-all}.ok{font-weight:700}</style><h1>早期实用型代币模拟扫描</h1><p><b>只用虚拟资金 · 无真实下单能力。</b> “实用型”仅表示公开资料出现用途证据，不等于项目已被验证或值得投资。</p><p id=s>读取中…</p><p><a href=/candidates.csv>导出累计候选 CSV</a> · <a href=/positions.csv>导出全部模拟仓位 CSV</a> · <a href=/api/scorecard>查看全量对账</a></p><p id=accounting></p><h2>虚拟仓位</h2><div id=p></div><h2>最近候选</h2><div id=c></div><script src=/app.js></script></html>"""
+SCRIPT="""const f=n=>n===null||n===undefined?'未核实':Number(n).toLocaleString(undefined,{maximumFractionDigits:2});const esc=v=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));function table(rows,cols){if(!rows.length)return '暂无';let h='<table><tr>'+cols.map(x=>'<th>'+x[0]+'</th>').join('')+'</tr>';for(const r of rows)h+='<tr>'+cols.map(x=>'<td>'+esc(x[1](r))+'</td>').join('')+'</tr>';return h+'</table>'}async function load(){try{let r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);let x=await r.json();document.getElementById('s').textContent=(x.ready?'扫描正常':'未就绪')+' | 扫描 '+x.scans+' | 异常 '+x.errors+' | 已平仓 '+x.closed+' | 胜 '+x.wins+' | 全历史已实现模拟毛盈亏 $'+f(x.realized_pnl);let a=x.accounting;document.getElementById('accounting').textContent='仓位统计共 '+a.positions+' 条，下面展示最近 '+x.positions_displayed+' 条；未平仓账面毛盈亏 $'+f(a.unrealized_gross_usd)+'；费用和滑点未记录，净利润未核实。'+(a.gross_ledger_reconciled?' 毛盈亏对账通过。':' 存在账目异常，不能据此判断收益。')+' Shadow仅记录信号，不能当作交易。';document.getElementById('p').innerHTML=table(x.positions,[['币',r=>r.symbol],['链',r=>r.chain],['状态',r=>r.status],['投入$',r=>f(r.usd)],['入场',r=>r.entry_price],['退出',r=>r.exit_price||''],['毛盈亏$',r=>r.status==='OPEN'?'未平仓':f(r.pnl)],['原因',r=>r.reason]]);document.getElementById('c').innerHTML=table(x.candidates.slice(0,50),[['币',r=>r.symbol],['链',r=>r.chain],['评分',r=>r.score],['市值',r=>'$'+f(r.market_cap)],['流动性',r=>'$'+f(r.liquidity)],['24h量',r=>'$'+f(r.volume24)],['首次价',r=>r.entry_price],['现价',r=>r.current_price],['最高涨幅',r=>f(r.max_return*100)+'%'],['用途证据',r=>r.evidence]]);}catch(e){document.getElementById('s').textContent='读取失败: '+e.message}}load();setInterval(load,60000);"""
 
 
 def make_handler(app:App):
@@ -366,6 +541,8 @@ def make_handler(app:App):
             if path=="/": return self.sendb(200,PAGE.encode(),"text/html; charset=utf-8")
             if path=="/app.js": return self.sendb(200,SCRIPT.encode(),"application/javascript; charset=utf-8")
             if path=="/api/status": return self.sendb(200,json.dumps(app.snapshot(),allow_nan=False).encode())
+            if path=="/api/scorecard": return self.sendb(200,json.dumps(app.store.accounting_snapshot(),allow_nan=False).encode())
+            if path=="/positions.csv": return self.sendb(200,app.store.positions_csv_bytes(),"text/csv; charset=utf-8")
             if path=="/candidates.csv": return self.sendb(200,app.store.csv_bytes(),"text/csv; charset=utf-8")
             return self.sendb(404,b'{"error":"not found"}')
     return H
