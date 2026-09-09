@@ -1,7 +1,7 @@
-# Paper-scanner: supervised workers and persistence regression suite.
+# Paper-scanner: supervised workers, persistence regression, and stock-style shadow research.
 FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-COPY discovery.py test_discovery.py history_replay.py test_history_replay.py launcher.py test_launcher.py strategy_v03.py test_strategy_v03.py strategy_v04.py test_strategy_v04.py strategy_v05.py test_strategy_v05.py strategy_v06.py test_strategy_v06.py strategy_v07.py test_strategy_v07.py shadow_ab.py test_shadow_ab.py ./
-RUN python -m unittest -v test_discovery test_history_replay test_strategy_v03 test_strategy_v04 test_strategy_v05 test_strategy_v06 test_strategy_v07 test_shadow_ab test_launcher
+COPY discovery.py test_discovery.py history_replay.py test_history_replay.py launcher.py test_launcher.py strategy_v03.py test_strategy_v03.py strategy_v04.py test_strategy_v04.py strategy_v05.py test_strategy_v05.py strategy_v06.py test_strategy_v06.py strategy_v07.py test_strategy_v07.py strategy_v08.py test_strategy_v08.py shadow_ab.py test_shadow_ab.py stock_style_shadow.py test_stock_style_shadow.py ./
+RUN python -m unittest -v test_discovery test_history_replay test_strategy_v03 test_strategy_v04 test_strategy_v05 test_strategy_v06 test_strategy_v07 test_strategy_v08 test_shadow_ab test_stock_style_shadow test_launcher
 CMD ["python", "-u", "launcher.py"]

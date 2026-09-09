@@ -1,0 +1,12 @@
+Preliminary exit-only counterfactual on the 8 already-closed losing paper trades.
+Same historical entries, no fees/slippage, no re-entry/add-on, no look-ahead parameter selection.
+Tier fills are conservatively valued at the tier threshold only when the observed holding-period maximum reached that threshold.
+No trailing-stop benefit is included because the complete minute-by-minute path was not available in the retained audit output.
+
+Baseline (+100% all-out): total gross PnL = -$277.79
+User +50/+70 partial scheme: total gross PnL ~= -$257.51
+Conservative +20/+40/+65 scheme: total gross PnL ~= -$170.98
+Balanced +25/+50/+75 scheme: total gross PnL ~= -$223.32
+Aggressive +30/+60/+100 scheme: total gross PnL ~= -$249.90
+
+This tiny 8-trade sample is diagnostic only, not evidence of future profitability. It does show that waiting until +50% for the first profit-taking tier missed several trades that later reversed sharply. The conservative 20/40 design is therefore prioritized for broader out-of-sample testing, not promoted directly to live trading.
