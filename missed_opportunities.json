@@ -1,0 +1,24 @@
+[
+  {
+    "case_id": "robinhood-zzz-2026-09-04",
+    "chain": "robinhood",
+    "address": "0x7dbf38976f6d3b9c529e7d9484a71898b409ee6a",
+    "symbol": "ZZZ",
+    "platform": "Pons V2",
+    "launch_date": "2026-09-04",
+    "classification": "MEME_WATCH_ONLY",
+    "root_causes": [
+      "scanner_not_live_at_launch",
+      "robinhood_missing_from_utility_discovery_chain_allowlist",
+      "utility_gate_rejects_meme_tokens",
+      "no_direct_pons_v2_factory_event_listener",
+      "latest_profile_feed_is_not_a_complete_new_launch_feed"
+    ],
+    "desired_detection": [
+      "index_PonsV2_TokenLaunched_onchain",
+      "track_first_24h_liquidity_and_volume_acceleration",
+      "keep_meme_momentum_separate_from_utility_entry_gate"
+    ],
+    "mode": "RETROSPECTIVE_WATCH_ONLY"
+  }
+]

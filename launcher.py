@@ -4,7 +4,7 @@ import json,signal,subprocess,sys,threading,time
 from pathlib import Path
 from typing import Sequence
 ROOT=Path(__file__).resolve().parent
-COMMANDS=(("discovery.py",), ("history_replay.py","--loop"), ("shadow_ab.py",), ("market_regime.py",), ("live_ohlcv.py",), ("stock_style_shadow.py",), ("v08_paper.py",), ("intelligence_hub.py",))
+COMMANDS=(("discovery.py",), ("robinhood_watch.py",), ("history_replay.py","--loop"), ("shadow_ab.py",), ("market_regime.py",), ("live_ohlcv.py",), ("stock_style_shadow.py",), ("v08_paper.py",), ("intelligence_hub.py",))
 def emit(event: str, **fields): print(json.dumps({"event":event,**fields},separators=(",",":")),flush=True)
 def stop_workers(workers,grace_seconds=15):
     deadline=time.monotonic()+grace_seconds

@@ -1,0 +1,34 @@
+ZZZ / Robinhood / Pons 早期发现补丁
+
+目标：
+1. 把 ZZZ 固化为漏检回归案例。
+2. 新增 Robinhood Chain / Pons V2 独立观察通道。
+3. 每 15 秒读取 Pons V2 链上 TokenLaunched 事件。
+4. 跟踪新币流动性、24h成交量/流动性比、1小时买卖压力。
+5. 只做 WATCH_ONLY，不会真实下单，也不会绕过原来的“实用型”入场门槛。
+
+上传到 GitHub 仓库根目录的 5 个文件：
+- robinhood_watch.py（新增）
+- test_robinhood_watch.py（新增）
+- missed_opportunities.json（新增）
+- launcher.py（覆盖原文件）
+- Dockerfile.discovery（覆盖原文件）
+
+最省事操作：
+在 crypto-paper-lab 仓库根目录选择 Add file / Upload files，
+把这 5 个文件一起上传；出现同名文件时覆盖 launcher.py 和 Dockerfile.discovery，
+然后 Commit changes 到 main。
+
+Railway 如果保持当前 GitHub 自动部署，会自动重新构建。
+构建阶段会额外运行 test_robinhood_watch；当前补丁本地 6/6 单元测试通过。
+
+验证日志应看到：
+ROBINHOOD_WATCH_STARTED
+ROBINHOOD_WATCH_CYCLE_OK
+新 Pons V2 发币时：
+ROBINHOOD_PONS_LAUNCH
+达到动量阈值时：
+ROBINHOOD_WATCH_ALERT
+
+注意：
+这是观察/模拟通道，没有钱包、私钥或真实订单能力。
