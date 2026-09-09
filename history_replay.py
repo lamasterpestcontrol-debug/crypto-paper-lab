@@ -4,13 +4,14 @@ Collects REAL public GeckoTerminal pool catalog + daily OHLCV into the existing
 /data/discovery.sqlite3. No wallet access and no live trading capability.
 """
 from __future__ import annotations
-import argparse, json, math, os, random, sqlite3, time, urllib.parse, urllib.request
+import argparse, json, math, os, random, sqlite3, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from live_ohlcv import SharedGTQuota, retry_after_seconds
 
 GT="https://api.geckoterminal.com/api/v2"
-VERSION="history-replay-0.2.1"
+VERSION="history-replay-0.3.0"
 NETWORKS=("solana","eth","base","bsc","arbitrum","polygon_pos")
 MIN_CALL_INTERVAL=max(7.5,float(os.getenv("HISTORY_MIN_CALL_INTERVAL","7.5")))
 UA="crypto-paper-lab-history/0.2"
@@ -143,13 +144,17 @@ def status(db):
       "jobs_ok":ok or 0,"jobs_error":err or 0,"pending_pools":pending}
 
 class Worker:
-    def __init__(self,db):
-        self.db=db; self.last_call=0.0
+    def __init__(self,db,quota=None):
+        self.db=db; self.last_call=0.0; self.quota=quota
     def call(self,path,params=None):
         wait=MIN_CALL_INTERVAL-(time.monotonic()-self.last_call)
         if wait>0: time.sleep(wait)
-        try: return gt_json(path,params)
-        finally: self.last_call=time.monotonic()
+        if self.quota:self.quota.acquire("history")
+        try:return gt_json(path,params)
+        except urllib.error.HTTPError as exc:
+            if exc.code==429 and self.quota:self.quota.penalize(retry_after_seconds(exc))
+            raise
+        finally:self.last_call=time.monotonic()
     def new_pools(self,page):
         n=catalog_response(self.db,self.call("/networks/new_pools",{"page":page}),
                            "new_pool_prospective",time.time())
@@ -180,7 +185,6 @@ class Worker:
             if any(row[0]>int(now) for row in rows):
                 raise ValueError("FUTURE_OHLCV_TIMESTAMP")
             if earliest and rows:
-                # Some APIs return the boundary candle inclusively. It is not progress.
                 older=[row for row in rows if row[0]<earliest]
                 if not older:
                     raise ValueError("NO_BACKFILL_PROGRESS: non-empty page contains no older candles")
@@ -234,8 +238,8 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--once",action="store_true"); ap.add_argument("--loop",action="store_true")
     args=ap.parse_args()
     data=Path(os.getenv("DATA_DIR","/data" if os.getenv("RAILWAY_ENVIRONMENT_ID") else "./discovery-data"))
-    db=db_connect(data/"discovery.sqlite3"); log_job(db,"history_start","OK",{"version":VERSION,"mode":"REAL_DATA_NO_TRADING"})
-    w=Worker(db)
+    db=db_connect(data/"discovery.sqlite3"); log_job(db,"history_start","OK",{"version":VERSION,"mode":"REAL_DATA_NO_TRADING","shared_quota":True})
+    quota=SharedGTQuota(data);w=Worker(db,quota=quota)
     try:
         if args.once: w.cycle(0)
         else: w.loop()

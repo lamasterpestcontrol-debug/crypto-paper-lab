@@ -4,15 +4,80 @@ Uses GeckoTerminal's free public API. It only follows a small number of recent/h
 shadow candidates to stay inside public rate limits. No wallet/order APIs.
 """
 from __future__ import annotations
-import json, math, os, sqlite3, time, urllib.parse, urllib.request
+import fcntl, json, math, os, sqlite3, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 GT="https://api.geckoterminal.com/api/v2"
-VERSION="live-ohlcv-0.1.0"
+VERSION="live-ohlcv-0.2.0"
 MIN_CALL_INTERVAL=max(2.2,float(os.getenv("LIVE_OHLCV_MIN_CALL_INTERVAL","2.2")))
 MAX_TOKENS=max(1,min(8,int(os.getenv("LIVE_OHLCV_MAX_TOKENS","6"))))
 NETWORK_MAP={"solana":"solana","ethereum":"eth","base":"base","bsc":"bsc","arbitrum":"arbitrum","polygon":"polygon_pos"}
 EVM={"ethereum","base","bsc","arbitrum","polygon"}
+SHARED_MIN_INTERVAL=max(3.0,float(os.getenv("GT_SHARED_MIN_INTERVAL","6.0")))
+REALTIME_HOLD_SECONDS=max(SHARED_MIN_INTERVAL,float(os.getenv("GT_REALTIME_HOLD_SECONDS","14.0")))
+
+class SharedGTQuota:
+    """Cross-process GeckoTerminal quota coordinator.
+
+    The live OHLC worker gets priority over history replay. A single state file under
+    the shared /data volume serializes calls across processes. HTTP 429 penalties are
+    also shared so one worker cannot keep hammering while another is backing off.
+    """
+    def __init__(self,data_dir:Path,min_interval=SHARED_MIN_INTERVAL,realtime_hold=REALTIME_HOLD_SECONDS,clock=None,sleeper=None):
+        self.path=Path(data_dir)/".geckoterminal_quota.json"
+        self.min_interval=max(0.1,float(min_interval));self.realtime_hold=max(0.0,float(realtime_hold))
+        self.clock=clock or time.time;self.sleeper=sleeper or time.sleep
+        self.path.parent.mkdir(parents=True,exist_ok=True)
+    def _locked(self,mutator):
+        with self.path.open("a+",encoding="utf-8") as f:
+            fcntl.flock(f.fileno(),fcntl.LOCK_EX)
+            try:
+                f.seek(0);raw=f.read().strip()
+                try:state=json.loads(raw) if raw else {}
+                except Exception:state={}
+                now=float(self.clock())
+                # Ignore stale/corrupt far-future state after a container restart or clock anomaly.
+                for k in ("next_allowed","blocked_until","realtime_until"):
+                    v=state.get(k,0)
+                    if not isinstance(v,(int,float)) or not math.isfinite(float(v)) or float(v)<0 or float(v)>now+3600:
+                        state[k]=0.0
+                result=mutator(state,now)
+                f.seek(0);f.truncate();json.dump(state,f,separators=(",",":"),allow_nan=False);f.flush();os.fsync(f.fileno())
+                return result
+            finally:fcntl.flock(f.fileno(),fcntl.LOCK_UN)
+    def acquire(self,role):
+        role=str(role).lower()
+        if role not in {"realtime","history"}:raise ValueError("invalid quota role")
+        while True:
+            def inspect(state,now):
+                gate=max(float(state.get("next_allowed",0)),float(state.get("blocked_until",0)))
+                if role=="history":gate=max(gate,float(state.get("realtime_until",0)))
+                if gate>now+0.002:return (False,gate-now)
+                state["next_allowed"]=now+self.min_interval
+                if role=="realtime":state["realtime_until"]=max(float(state.get("realtime_until",0)),now+self.realtime_hold)
+                state["last_role"]=role;state["last_call_at"]=now
+                return (True,0.0)
+            ok,wait=self._locked(inspect)
+            if ok:return
+            self.sleeper(max(0.001,min(float(wait),5.0)))
+    def penalize(self,seconds=60.0):
+        penalty=max(5.0,min(600.0,float(seconds)))
+        def apply(state,now):
+            until=now+penalty
+            state["blocked_until"]=max(float(state.get("blocked_until",0)),until)
+            state["next_allowed"]=max(float(state.get("next_allowed",0)),until)
+            state["last_429_at"]=now
+            return until
+        return self._locked(apply)
+    def snapshot(self):
+        return self._locked(lambda state,now:dict(state))
+
+def retry_after_seconds(exc,default=60.0):
+    try:
+        raw=exc.headers.get("Retry-After") if exc.headers else None
+        value=float(raw) if raw is not None else float(default)
+        return max(15.0,min(600.0,value))
+    except Exception:return float(default)
 
 def emit(event,**fields):
     print(json.dumps({"event":event,"version":VERSION,**fields},separators=(",",":"),allow_nan=False),flush=True)
@@ -126,11 +191,15 @@ def load_true_bars(db,chain,address,limit=60):
       WHERE chain=? AND address=? AND timeframe='minute' ORDER BY ts DESC LIMIT ?""",(chain,address,limit)).fetchall()[::-1]
 
 class Worker:
-    def __init__(self,db):self.db=db;self.last_call=0.0
+    def __init__(self,db,quota=None):self.db=db;self.last_call=0.0;self.quota=quota
     def call(self,path,params=None):
         wait=MIN_CALL_INTERVAL-(time.monotonic()-self.last_call)
         if wait>0:time.sleep(wait)
+        if self.quota:self.quota.acquire("realtime")
         try:return gt_json(path,params)
+        except urllib.error.HTTPError as exc:
+            if exc.code==429 and self.quota:self.quota.penalize(retry_after_seconds(exc))
+            raise
         finally:self.last_call=time.monotonic()
     def pool_for(self,chain,address,now):
         row=self.db.execute("SELECT * FROM live_pool_map WHERE chain=? AND address=?",(chain,address)).fetchone()
@@ -155,12 +224,12 @@ class Worker:
             try:results.append(self.collect_one(str(c["chain"]),str(c["address"]),now))
             except Exception as exc:
                 errors+=1;results.append({"chain":c["chain"],"address":c["address"],"status":"ERROR","error_type":type(exc).__name__})
-        emit("LIVE_OHLCV_CYCLE_OK" if not errors else "LIVE_OHLCV_CYCLE_DEGRADED",observed=len(cands),errors=errors,sample=results[:3],source="GECKOTERMINAL_PUBLIC",no_trade=True)
+        emit("LIVE_OHLCV_CYCLE_OK" if not errors else "LIVE_OHLCV_CYCLE_DEGRADED",observed=len(cands),errors=errors,sample=results[:3],source="GECKOTERMINAL_PUBLIC",shared_quota=bool(self.quota),no_trade=True)
         return {"observed":len(cands),"errors":errors}
 
 def main():
     data=Path(os.getenv("DATA_DIR","/data" if os.getenv("RAILWAY_ENVIRONMENT_ID") else "./discovery-data"));data.mkdir(parents=True,exist_ok=True)
-    db=dbopen(data/"discovery.sqlite3");w=Worker(db)
+    db=dbopen(data/"discovery.sqlite3");quota=SharedGTQuota(data);w=Worker(db,quota=quota)
     try:
         while True:
             started=time.monotonic()

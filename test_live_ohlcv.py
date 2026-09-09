@@ -33,3 +33,30 @@ class GMGNCandidateTests(unittest.TestCase):
             db.execute("CREATE TABLE gmgn_discovery_candidates(chain TEXT,address TEXT,symbol TEXT,priority REAL,last_seen REAL)")
             now=time.time();db.execute("INSERT INTO gmgn_discovery_candidates VALUES(?,?,?,?,?)",("solana","GMGNADDR","GM",95,now));db.commit()
             rows=l.select_candidates(db,now,5);self.assertEqual(rows[0]["address"],"GMGNADDR");db.close()
+
+class SharedQuotaTests(unittest.TestCase):
+    class Clock:
+        def __init__(self,now=1000.0):self.now=float(now)
+        def __call__(self):return self.now
+        def sleep(self,seconds):self.now+=float(seconds)
+    def test_realtime_priority_makes_history_yield(self):
+        with tempfile.TemporaryDirectory() as td:
+            c=self.Clock();q1=l.SharedGTQuota(Path(td),min_interval=5,realtime_hold=12,clock=c,sleeper=c.sleep);q2=l.SharedGTQuota(Path(td),min_interval=5,realtime_hold=12,clock=c,sleeper=c.sleep)
+            q1.acquire('realtime');self.assertEqual(c.now,1000.0)
+            q2.acquire('history');self.assertGreaterEqual(c.now,1012.0)
+            state=q2.snapshot();self.assertEqual(state['last_role'],'history');self.assertGreaterEqual(state['next_allowed'],1017.0)
+    def test_429_penalty_is_shared_between_instances(self):
+        with tempfile.TemporaryDirectory() as td:
+            c=self.Clock();q1=l.SharedGTQuota(Path(td),min_interval=5,realtime_hold=0,clock=c,sleeper=c.sleep);q2=l.SharedGTQuota(Path(td),min_interval=5,realtime_hold=0,clock=c,sleeper=c.sleep)
+            q1.acquire('realtime');q1.penalize(30);q2.acquire('realtime')
+            self.assertGreaterEqual(c.now,1030.0)
+    def test_worker_uses_realtime_shared_quota(self):
+        class Q:
+            def __init__(self):self.roles=[]
+            def acquire(self,role):self.roles.append(role)
+            def penalize(self,_):pass
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            db=l.dbopen(Path(td)/'x.db');q=Q();w=l.Worker(db,quota=q)
+            with patch.object(l,'gt_json',return_value={'data':[]}):self.assertEqual(w.call('/networks/x/pools'),{'data':[]})
+            self.assertEqual(q.roles,['realtime']);db.close()

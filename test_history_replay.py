@@ -25,8 +25,6 @@ class HistoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_ohlcv({"x":1})
 
-
-
 import io,json
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -149,5 +147,16 @@ class BackfillBoundaryTests(unittest.TestCase):
         self.assertEqual((event["network"],event["pool"],event["error_type"]),("eth","0xabc","TimeoutError"))
         self.assertFalse(event["done"])
 
-if __name__=="__main__":
-    unittest.main()
+
+class SharedQuotaIntegrationTests(unittest.TestCase):
+    def test_history_worker_uses_history_quota_role(self):
+        class Q:
+            def __init__(self):self.roles=[]
+            def acquire(self,role):self.roles.append(role)
+            def penalize(self,_):pass
+        with tempfile.TemporaryDirectory() as td:
+            db=hr.db_connect(Path(td)/"x.db");q=Q();w=hr.Worker(db,quota=q)
+            with patch.object(hr,"gt_json",return_value={"data":[]}):self.assertEqual(w.call("/networks/new_pools"),{"data":[]})
+            self.assertEqual(q.roles,["history"]);db.close()
+
+if __name__=="__main__":unittest.main()
