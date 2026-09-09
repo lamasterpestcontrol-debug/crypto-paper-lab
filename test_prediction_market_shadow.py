@@ -58,4 +58,79 @@ class T(unittest.TestCase):
             self.assertNotIn("orders",names);self.assertNotIn("wallets",names)
             db.close()
 
+    def test_current_updown_slug_and_labels(self):
+        m={"id":"u1","conditionId":"cu1","question":"Bitcoin Up or Down - September 9, 8:15PM-8:30PM ET","slug":"btc-updown-15m-1788999300","description":"Resolves using the Chainlink BTC/USD TWAP data stream.","resolutionSource":"https://data.chain.link/streams/btc-usd-twap-60s-streams","outcomes":"[\"Up\",\"Down\"]","clobTokenIds":"[\"upTok\",\"dnTok\"]","endDate":"2030-01-01T00:00:00Z"}
+        x=p.normalize_market(m,now=1_700_000_000)
+        self.assertIsNotNone(x);self.assertEqual((x["yes_label"],x["no_label"]),("Up","Down"));self.assertEqual((x["yes_token"],x["no_token"]),("upTok","dnTok"))
+        self.assertIsNone(x["strike"]);self.assertEqual(x["settlement_kind"],p.SETTLEMENT_CHAINLINK_TWAP)
+
+    def test_public_search_event_flattens_market(self):
+        def f(path,params):
+            if path=="/public-search":
+                return {"events":[{"title":"BTC Up or Down 15m","slug":"btc-updown-15m-123","description":"Chainlink TWAP rules","resolutionSource":"https://data.chain.link/streams/btc-usd-twap-60s-streams","markets":[{"id":"msearch","conditionId":"csearch","question":"Bitcoin Up or Down - September 9, 8:15PM-8:30PM ET","outcomes":"[\"Up\",\"Down\"]","clobTokenIds":"[\"u\",\"d\"]","endDate":"2030-01-01T00:00:00Z"}]}]}
+            if path=="/markets":return []
+            raise AssertionError(path)
+        xs=p.discover_markets(f,now=1_700_000_000)
+        self.assertEqual(len(xs),1);self.assertEqual(xs[0]["market_id"],"msearch");self.assertTrue(xs[0]["discovery_source"].startswith("GAMMA_PUBLIC_SEARCH"))
+
+    def test_unknown_binary_labels_rejected(self):
+        m={"id":"weird","question":"BTC 15m choice","slug":"btc-15m","outcomes":"[\"A\",\"B\"]","clobTokenIds":"[\"a\",\"b\"]"}
+        self.assertIsNone(p.normalize_market(m,now=1_700_000_000))
+
+    def test_binance_us_rest_fallback_same_venue(self):
+        calls=[]
+        def f(path,params):
+            calls.append((path,params.get("symbol")))
+            if path=="/ticker/price":return {"price":"81234.5"}
+            if path=="/klines":return [[i*60000,"0","0","0",str(80000+i*3),"0"] for i in range(61)]
+            raise AssertionError(path)
+        with tempfile.TemporaryDirectory() as td:
+            db=p.dbopen(Path(td)/"x.db")
+            st=p.btc_market_state(db,now=2_000_000_000,rest_fetch=f,cache={})
+            self.assertEqual(st["source"],p.SOURCE_BTC_REST);self.assertEqual(st["price"],81234.5);self.assertGreater(st["sigma_1m"],0)
+            self.assertTrue(all(sym in {"BTCUSDT","BTCUSD"} for _,sym in calls if sym))
+            db.close()
+
+    def test_fresh_local_btc_wins_over_rest(self):
+        def no_rest(*args,**kwargs):raise AssertionError("REST should not be needed")
+        with tempfile.TemporaryDirectory() as td:
+            db=p.dbopen(Path(td)/"x.db")
+            db.execute("CREATE TABLE major_ticks(symbol TEXT,trade_id INTEGER,ts_ms INTEGER,price REAL,qty REAL,buyer_maker INTEGER,source TEXT)")
+            now=2_000_000_000.0
+            rows=[("BTC",i,int((now-(69-i)*60)*1000),80000+i*2,1,0,"TEST") for i in range(70)]
+            db.executemany("INSERT INTO major_ticks VALUES(?,?,?,?,?,?,?)",rows);db.commit()
+            st=p.btc_market_state(db,now=now,rest_fetch=no_rest,cache={})
+            self.assertEqual(st["source"],p.SOURCE_BTC);self.assertEqual(st["price"],80138);self.assertLessEqual(st["age_s"],.001)
+            db.close()
+
+    def test_existing_v14_database_gets_additive_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"x.db";raw=__import__("sqlite3").connect(path)
+            raw.execute("CREATE TABLE prediction_markets(market_id TEXT PRIMARY KEY,condition_id TEXT,question TEXT NOT NULL,slug TEXT,end_ts REAL,yes_token TEXT NOT NULL,no_token TEXT NOT NULL,liquidity REAL,volume REAL,strike REAL,question_kind TEXT NOT NULL,last_seen REAL NOT NULL,source TEXT NOT NULL)")
+            raw.execute("CREATE TABLE prediction_snapshots(id INTEGER PRIMARY KEY,ts REAL NOT NULL,market_id TEXT NOT NULL,question TEXT NOT NULL,yes_bid REAL,yes_ask REAL,no_bid REAL,no_ask REAL,yes_depth_usd REAL,no_depth_usd REAL,btc_spot REAL,hl_mid REAL,hl_funding REAL,hl_premium REAL,hl_open_interest REAL,hl_book_imbalance REAL,seconds_to_expiry REAL,model_yes REAL,model_edge_cents REAL,complement_cost REAL,complement_edge_cents REAL,raw_json TEXT NOT NULL)")
+            raw.commit();raw.close();db=p.dbopen(path)
+            mc={r[1] for r in db.execute("PRAGMA table_info(prediction_markets)")};sc={r[1] for r in db.execute("PRAGMA table_info(prediction_snapshots)")}
+            self.assertTrue({"yes_label","no_label","settlement_kind","resolution_source","discovery_source"}<=mc);self.assertTrue({"btc_source","btc_age_s"}<=sc);db.close()
+
+    def test_updown_cycle_complement_only_no_model_guess(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=p.dbopen(Path(td)/"x.db");now=2_000_000_000.0
+            def mf(path,params):
+                if path=="/public-search":return {"events":[{"title":"BTC Up or Down 15m","slug":"btc-updown-15m-x","description":"Chainlink BTC/USD TWAP","resolutionSource":"https://data.chain.link/streams/btc-usd-twap-60s-streams","markets":[{"id":"um","question":"Bitcoin Up or Down - 8:15PM-8:30PM ET","outcomes":"[\"Up\",\"Down\"]","clobTokenIds":"[\"u\",\"d\"]","endDate":"2033-05-18T03:33:20Z"}]}]}
+                return []
+            def bf(path,params):return {"bids":[{"price":"0.40","size":"100"}],"asks":[{"price":"0.45" if params["token_id"]=="u" else "0.50","size":"100"}]}
+            def hf(body):
+                if body["type"]=="metaAndAssetCtxs":return [{"universe":[{"name":"BTC"}]},[{"midPx":"80000","funding":"0","premium":"0","openInterest":"100"}]]
+                return {"levels":[[{"px":"79999","sz":"1"}],[{"px":"80001","sz":"1"}]]}
+            def rf(path,params):
+                if path=="/ticker/price":return {"price":"80000"}
+                return [[i*60000,"0","0","0",str(80000+i),"0"] for i in range(61)]
+            out=p.cycle(db,now=now,market_fetch=mf,book_fetch=bf,hyper_fetch=hf,btc_rest_fetch=rf,force_refresh=True,btc_cache={})
+            self.assertEqual(out["observed"],1);self.assertGreaterEqual(out["signals"],1);self.assertEqual(out["unresolved_reference"],1)
+            snap=db.execute("SELECT model_yes,raw_json FROM prediction_snapshots ORDER BY id DESC LIMIT 1").fetchone();self.assertIsNone(snap[0]);self.assertIn(p.SETTLEMENT_CHAINLINK_TWAP,snap[1])
+            kinds=[r[0] for r in db.execute("SELECT signal_type FROM prediction_signals")];self.assertEqual(set(kinds),{"YES_NO_COMPLEMENT"});db.close()
+
+    def test_model_signal_source_keeps_btc_provenance(self):
+        self.assertNotEqual(p.SOURCE_BTC,p.SOURCE_BTC_REST)
+
 if __name__=='__main__':unittest.main()
