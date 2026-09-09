@@ -1,22 +1,20 @@
-V12 MEME public-routing fix — PAPER ONLY
+V14 Cross-Market Shadow
 
-Upload ONLY these 2 code files to the repository root and replace the same-name files:
-1. decision_worker.py
-2. test_decision_worker.py
-
-Repository:
+Upload the 5 code files in this archive to the ROOT of:
 lamasterpestcontrol-debug/crypto-paper-lab
 
-What this fixes:
-- Obvious public meme candidates such as WOOF / WENPEPE / *INU can enter the existing MEME research path even when GMGN_API_KEY is absent.
-- Utility-new-token classification still wins first when real-utility evidence is strong.
-- Boundary safety prevents false substring matches such as CATALOG -> cat or MINUTE -> inu.
-- This changes classification/routing only. It does NOT lower entry thresholds or bypass true-OHLC, liquidity, persistence, insider, concentration, contract-risk, market-regime, or shock gates.
-- PAPER ONLY. No wallet/order API added.
+Replace same-name files; add new files.
+Do not delete other repository files.
+Do not change Railway manually.
 
-Local validation performed:
-- Python compile: OK
-- Isolated token_scope routing validation: OK
-- 4 new targeted routing tests: 4/4 OK
+Scope:
+- READ-ONLY / PAPER SHADOW ONLY.
+- Polymarket public market/order-book data.
+- Hyperliquid public BTC perp market data.
+- Local Binance.US BTC major-tick data.
+- YES+NO complement-dislocation checks.
+- Fixed-strike BTC fair-value dislocation research.
+- Ambiguous 'up/down' markets cannot create model signals until their reference price is resolved.
+- No wallet, signer, API key, private key, or order endpoint.
 
-After upload, Railway should auto-deploy. Cloud validation must still pass before this is called deployed/working.
+Local full regression: 277 tests passed, 0 failed.

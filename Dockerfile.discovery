@@ -18,10 +18,10 @@ COPY discovery.py test_discovery.py history_replay.py test_history_replay.py lau
  cross_asset.py test_cross_asset.py external_events.py test_external_events.py gmgn_intel.py test_gmgn_intel.py \
  major_microstructure.py test_major_microstructure.py decision_engine.py test_decision_engine.py \
  decision_worker.py test_decision_worker.py major_paper.py test_major_paper.py \
- calibration_worker.py test_calibration_worker.py intelligence_hub.py test_intelligence_hub.py ./
+ calibration_worker.py test_calibration_worker.py prediction_market_shadow.py test_prediction_market_shadow.py intelligence_hub.py test_intelligence_hub.py ./
 RUN python -m unittest -v \
  test_discovery test_history_replay test_strategy_v03 test_strategy_v04 test_strategy_v05 test_strategy_v06 test_strategy_v07 test_strategy_v08 \
  test_shadow_ab test_market_regime test_live_ohlcv test_stock_style_shadow test_v08_paper \
  test_cross_asset test_external_events test_gmgn_intel test_major_microstructure test_decision_engine test_decision_worker \
- test_major_paper test_calibration_worker test_intelligence_hub test_launcher
+ test_major_paper test_calibration_worker test_prediction_market_shadow test_intelligence_hub test_launcher
 CMD ["python", "-u", "launcher.py"]

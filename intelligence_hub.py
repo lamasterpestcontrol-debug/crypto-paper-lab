@@ -7,7 +7,7 @@ so launcher.py can fail the service instead of leaving a false-green deployment.
 """
 from __future__ import annotations
 import json, threading, time
-import calibration_worker, cross_asset, decision_worker, external_events, gmgn_intel, major_microstructure, major_paper
+import calibration_worker, cross_asset, decision_worker, external_events, gmgn_intel, major_microstructure, major_paper, prediction_market_shadow
 
 VERSION="intelligence-hub-0.2.0"
 COMPONENTS=(
@@ -17,6 +17,7 @@ COMPONENTS=(
     ("major_microstructure",major_microstructure.main),
     ("decision_worker",decision_worker.main),
     ("major_paper",major_paper.main),
+    ("prediction_market_shadow",prediction_market_shadow.main),
     ("calibration_worker",calibration_worker.main),
 )
 

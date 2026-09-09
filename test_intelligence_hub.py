@@ -5,7 +5,7 @@ import intelligence_hub as h
 
 class T(unittest.TestCase):
     def test_expected_components_present(self):
-        self.assertEqual([x[0] for x in h.COMPONENTS],["external_events","gmgn_intel","cross_asset","major_microstructure","decision_worker","major_paper","calibration_worker"])
+        self.assertEqual([x[0] for x in h.COMPONENTS],["external_events","gmgn_intel","cross_asset","major_microstructure","decision_worker","major_paper","prediction_market_shadow","calibration_worker"])
     def test_dead_component_fails_hub(self):
         gate=threading.Event()
         def alive():gate.wait(2)
