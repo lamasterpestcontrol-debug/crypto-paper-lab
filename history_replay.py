@@ -11,7 +11,7 @@ from typing import Any
 from live_ohlcv import SharedGTQuota, retry_after_seconds
 
 GT="https://api.geckoterminal.com/api/v2"
-VERSION="history-replay-0.3.0"
+VERSION="history-replay-0.3.1"
 NETWORKS=("solana","eth","base","bsc","arbitrum","polygon_pos")
 MIN_CALL_INTERVAL=max(7.5,float(os.getenv("HISTORY_MIN_CALL_INTERVAL","7.5")))
 UA="crypto-paper-lab-history/0.2"

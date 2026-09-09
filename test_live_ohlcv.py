@@ -50,6 +50,30 @@ class SharedQuotaTests(unittest.TestCase):
             c=self.Clock();q1=l.SharedGTQuota(Path(td),min_interval=5,realtime_hold=0,clock=c,sleeper=c.sleep);q2=l.SharedGTQuota(Path(td),min_interval=5,realtime_hold=0,clock=c,sleeper=c.sleep)
             q1.acquire('realtime');q1.penalize(30);q2.acquire('realtime')
             self.assertGreaterEqual(c.now,1030.0)
+
+    def test_overdue_history_ignores_realtime_hold_and_gets_slot(self):
+        with tempfile.TemporaryDirectory() as td:
+            c=self.Clock();q=l.SharedGTQuota(Path(td),min_interval=5,realtime_hold=60,history_max_wait=10,reservation_seconds=5,clock=c,sleeper=c.sleep)
+            def seed(state,now):
+                state["next_allowed"]=now
+                state["realtime_until"]=now+60
+                state["history_wait_since"]=now-11
+            q._locked(seed)
+            q.acquire("history")
+            self.assertEqual(c.now,1000.0)
+            state=q.snapshot();self.assertEqual(state["last_role"],"history");self.assertEqual(state["history_wait_since"],0.0)
+
+    def test_cycle_exposes_http_status_for_rate_limit_diagnostics(self):
+        import io,json,urllib.error
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            db=l.dbopen(Path(td)/"x.db");w=l.Worker(db)
+            err=urllib.error.HTTPError("https://example.test",429,"Too Many Requests",{},None)
+            with patch.object(l,"select_candidates",return_value=[{"chain":"solana","address":"x"}]),patch.object(w,"collect_one",side_effect=err),redirect_stdout(io.StringIO()) as out:
+                w.cycle()
+            event=json.loads(out.getvalue())
+            self.assertEqual(event["sample"][0]["http_code"],429);db.close()
     def test_worker_uses_realtime_shared_quota(self):
         class Q:
             def __init__(self):self.roles=[]

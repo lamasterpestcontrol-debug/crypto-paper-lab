@@ -8,13 +8,15 @@ import fcntl, json, math, os, sqlite3, time, urllib.error, urllib.parse, urllib.
 from pathlib import Path
 
 GT="https://api.geckoterminal.com/api/v2"
-VERSION="live-ohlcv-0.2.0"
+VERSION="live-ohlcv-0.2.1"
 MIN_CALL_INTERVAL=max(2.2,float(os.getenv("LIVE_OHLCV_MIN_CALL_INTERVAL","2.2")))
 MAX_TOKENS=max(1,min(8,int(os.getenv("LIVE_OHLCV_MAX_TOKENS","6"))))
 NETWORK_MAP={"solana":"solana","ethereum":"eth","base":"base","bsc":"bsc","arbitrum":"arbitrum","polygon":"polygon_pos"}
 EVM={"ethereum","base","bsc","arbitrum","polygon"}
 SHARED_MIN_INTERVAL=max(3.0,float(os.getenv("GT_SHARED_MIN_INTERVAL","6.0")))
 REALTIME_HOLD_SECONDS=max(SHARED_MIN_INTERVAL,float(os.getenv("GT_REALTIME_HOLD_SECONDS","14.0")))
+HISTORY_MAX_WAIT=max(SHARED_MIN_INTERVAL*2,float(os.getenv("GT_HISTORY_MAX_WAIT","30.0")))
+HISTORY_RESERVATION_SECONDS=max(SHARED_MIN_INTERVAL,float(os.getenv("GT_HISTORY_RESERVATION_SECONDS","12.0")))
 
 class SharedGTQuota:
     """Cross-process GeckoTerminal quota coordinator.
@@ -23,9 +25,10 @@ class SharedGTQuota:
     the shared /data volume serializes calls across processes. HTTP 429 penalties are
     also shared so one worker cannot keep hammering while another is backing off.
     """
-    def __init__(self,data_dir:Path,min_interval=SHARED_MIN_INTERVAL,realtime_hold=REALTIME_HOLD_SECONDS,clock=None,sleeper=None):
+    def __init__(self,data_dir:Path,min_interval=SHARED_MIN_INTERVAL,realtime_hold=REALTIME_HOLD_SECONDS,history_max_wait=HISTORY_MAX_WAIT,reservation_seconds=HISTORY_RESERVATION_SECONDS,clock=None,sleeper=None):
         self.path=Path(data_dir)/".geckoterminal_quota.json"
         self.min_interval=max(0.1,float(min_interval));self.realtime_hold=max(0.0,float(realtime_hold))
+        self.history_max_wait=max(self.min_interval,float(history_max_wait));self.reservation_seconds=max(self.min_interval,float(reservation_seconds))
         self.clock=clock or time.time;self.sleeper=sleeper or time.sleep
         self.path.parent.mkdir(parents=True,exist_ok=True)
     def _locked(self,mutator):
@@ -37,7 +40,7 @@ class SharedGTQuota:
                 except Exception:state={}
                 now=float(self.clock())
                 # Ignore stale/corrupt far-future state after a container restart or clock anomaly.
-                for k in ("next_allowed","blocked_until","realtime_until"):
+                for k in ("next_allowed","blocked_until","realtime_until","history_wait_since","history_reserved_until"):
                     v=state.get(k,0)
                     if not isinstance(v,(int,float)) or not math.isfinite(float(v)) or float(v)<0 or float(v)>now+3600:
                         state[k]=0.0
@@ -51,10 +54,32 @@ class SharedGTQuota:
         while True:
             def inspect(state,now):
                 gate=max(float(state.get("next_allowed",0)),float(state.get("blocked_until",0)))
-                if role=="history":gate=max(gate,float(state.get("realtime_until",0)))
-                if gate>now+0.002:return (False,gate-now)
-                state["next_allowed"]=now+self.min_interval
-                if role=="realtime":state["realtime_until"]=max(float(state.get("realtime_until",0)),now+self.realtime_hold)
+                waiting_since=float(state.get("history_wait_since",0) or 0)
+                reserved_until=float(state.get("history_reserved_until",0) or 0)
+                if role=="history":
+                    if waiting_since<=0:
+                        waiting_since=now;state["history_wait_since"]=now
+                    waited=max(0.0,now-waiting_since)
+                    # Realtime normally has priority, but it may not starve history forever.
+                    if waited<self.history_max_wait:
+                        gate=max(gate,float(state.get("realtime_until",0)))
+                    else:
+                        state["history_reserved_until"]=max(reserved_until,now+self.reservation_seconds)
+                    if gate>now+0.002:return (False,gate-now)
+                    state["next_allowed"]=now+self.min_interval
+                    state["history_wait_since"]=0.0;state["history_reserved_until"]=0.0
+                    state["last_history_at"]=now
+                else:
+                    # Once a history waiter has exceeded its maximum wait, reserve the
+                    # next available slot for it instead of continuously renewing realtime.
+                    if waiting_since>0 and now-waiting_since>=self.history_max_wait:
+                        if reserved_until<=now:
+                            reserved_until=now+self.reservation_seconds;state["history_reserved_until"]=reserved_until
+                        gate=max(gate,reserved_until)
+                    if gate>now+0.002:return (False,gate-now)
+                    state["next_allowed"]=now+self.min_interval
+                    state["realtime_until"]=max(float(state.get("realtime_until",0)),now+self.realtime_hold)
+                    state["last_realtime_at"]=now
                 state["last_role"]=role;state["last_call_at"]=now
                 return (True,0.0)
             ok,wait=self._locked(inspect)
@@ -223,7 +248,10 @@ class Worker:
         for c in cands:
             try:results.append(self.collect_one(str(c["chain"]),str(c["address"]),now))
             except Exception as exc:
-                errors+=1;results.append({"chain":c["chain"],"address":c["address"],"status":"ERROR","error_type":type(exc).__name__})
+                errors+=1
+                item={"chain":c["chain"],"address":c["address"],"status":"ERROR","error_type":type(exc).__name__}
+                if isinstance(exc,urllib.error.HTTPError):item["http_code"]=int(exc.code)
+                results.append(item)
         emit("LIVE_OHLCV_CYCLE_OK" if not errors else "LIVE_OHLCV_CYCLE_DEGRADED",observed=len(cands),errors=errors,sample=results[:3],source="GECKOTERMINAL_PUBLIC",shared_quota=bool(self.quota),no_trade=True)
         return {"observed":len(cands),"errors":errors}
 
