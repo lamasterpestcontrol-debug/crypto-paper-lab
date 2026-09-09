@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "utility-discovery-0.1.0"
+VERSION = "utility-discovery-0.1.1"
 LOG = logging.getLogger("discovery")
 D = Decimal
 DEX = "https://api.dexscreener.com"
@@ -95,14 +95,29 @@ def best_pair(pairs: Any, address: str) -> dict[str, Any] | None:
     return max(eligible, key=lambda p: num((p.get("liquidity") or {}).get("usd")))
 
 
+def _normalized_words(text: str) -> str:
+    """Normalize punctuation without allowing substring keyword matches.
+
+    A token such as ``ai`` must not match ``claim``/``fair``/``daily`` and
+    ``cat`` must not match ``catalog``. Multi-word phrases remain matchable
+    across punctuation such as ``real-world asset``.
+    """
+    return " " + re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip() + " "
+
+
+def _term_present(normalized_text: str, term: str) -> bool:
+    normalized_term = re.sub(r"[^a-z0-9]+", " ", str(term).lower()).strip()
+    return bool(normalized_term) and f" {normalized_term} " in normalized_text
+
+
 def utility_evidence(profile: dict[str, Any], pair: dict[str, Any]) -> tuple[list[str], bool]:
     desc = str(profile.get("description") or "").strip()
-    text = desc.lower()
+    normalized = _normalized_words(desc)
     websites = (pair.get("info") or {}).get("websites") or []
     socials = (pair.get("info") or {}).get("socials") or []
     links = profile.get("links") or []
-    utility_hits = sorted(t for t in UTILITY_TERMS if t in text)
-    meme_hit = any(t in text for t in MEME_TERMS)
+    utility_hits = sorted(t for t in UTILITY_TERMS if _term_present(normalized, t))
+    meme_hit = any(_term_present(normalized, t) for t in MEME_TERMS)
     evidence = []
     if desc:
         evidence.append("profile_description")
@@ -150,7 +165,8 @@ def assess(profile: dict[str, Any], pair: dict[str, Any], now_ms: int) -> Assess
     websites = (pair.get("info") or {}).get("websites") or []
     socials = (pair.get("info") or {}).get("socials") or []
     desc = str(profile.get("description") or "")
-    utility_hit = any(t in desc.lower() for t in UTILITY_TERMS)
+    normalized_desc = _normalized_words(desc)
+    utility_hit = any(_term_present(normalized_desc, t) for t in UTILITY_TERMS)
     score = 0
     score += 2 if websites else 0
     score += 1 if socials or profile.get("links") else 0

@@ -19,6 +19,26 @@ class Tests(unittest.TestCase):
         now=1_000_000+24*3600*1000
         a=assess({"description":"fun meme dog community coin with AI"},pair(),now)
         self.assertFalse(a.eligible)
+    def test_short_utility_keywords_require_word_boundaries(self):
+        now=1_000_000+24*3600*1000
+        for desc in ("Claim rewards today", "A fair launch for everyone", "Join our daily celebration", "Rapidly growing community"):
+            with self.subTest(desc=desc):
+                a=assess({"description":desc,"links":[{"url":"https://x"}]},pair(),now)
+                self.assertFalse(a.eligible)
+                self.assertNotIn("utility_terms:ai",a.evidence)
+                self.assertNotIn("utility_terms:api",a.evidence)
+
+    def test_meme_keywords_require_word_boundaries(self):
+        now=1_000_000+24*3600*1000
+        a=assess({"description":"AI data developer catalog for enterprise","links":[{"url":"https://x"}]},pair(),now)
+        self.assertTrue(a.eligible)
+        self.assertNotIn("meme",a.evidence.lower())
+
+    def test_multiword_utility_phrase_matches_across_punctuation(self):
+        now=1_000_000+24*3600*1000
+        a=assess({"description":"Real-world asset tokenization infrastructure","links":[{"url":"https://x"}]},pair(),now)
+        self.assertTrue(a.eligible)
+        self.assertIn("real world asset",a.evidence)
     def test_paper_position_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
             s=Store(Path(d)/"x.db"); self.addCleanup(s.db.close); now=1_000_000+24*3600*1000
