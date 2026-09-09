@@ -483,7 +483,11 @@ class App:
 
     def _profiles(self) -> list[dict[str,Any]]:
         raw = public_json("/token-profiles/latest/v1")
-        return [p for p in raw if isinstance(p,dict)] if isinstance(raw,list) else []
+        if not isinstance(raw,list):
+            # A malformed/provider-error object is not an empty healthy feed. Fail closed
+            # so scan_once records PAUSED rather than a false OK with observed=0.
+            raise ValueError("profile feed is not a list")
+        return [p for p in raw if isinstance(p,dict)]
 
     def scan_once(self) -> dict[str,Any]:
         now = time.time(); now_ms = int(now*1000); opened=[]; closed=[]; observed=0

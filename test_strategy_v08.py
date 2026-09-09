@@ -38,3 +38,15 @@ class T(unittest.TestCase):
             self.assertAlmostEqual(sum(x.sell_fraction_initial for x in p.tiers)+p.runner_fraction_initial,1)
 
 if __name__=='__main__': unittest.main()
+
+class RegimeSizingTests(unittest.TestCase):
+    def signal(self):
+        return TrendSnapshot(1,0.98,0.95,60,.02,.02,1.5,True,True,False,True,"TEST")
+    def test_regime_initial_sizing_order(self):
+        s=self.signal()
+        vals=[initial_entry_budget(100,s,p) for p in (CONSERVATIVE,BALANCED,AGGRESSIVE)]
+        self.assertEqual(vals,[35.0,50.0,60.0])
+    def test_conservative_max_deployment_is_seventy_percent(self):
+        p=CONSERVATIVE;s=self.signal()
+        st=PositionState(100,70,10,1,1.2,10)
+        self.assertFalse(pyramiding_allowed(st,1.15,s,p))

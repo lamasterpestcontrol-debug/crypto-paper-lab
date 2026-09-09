@@ -99,9 +99,12 @@ class Params:
         if tuple(t.gain for t in self.tiers)!=tuple(sorted(t.gain for t in self.tiers)): raise ValueError("tiers ascending")
         if not (0<self.first_entry_fraction<=self.max_deployed_fraction<=1): raise ValueError("invalid deployment")
 
-CONSERVATIVE=Params((ProfitTier(.20,.25),ProfitTier(.40,.25),ProfitTier(.65,.20)),.30,.20,2.2,add_fraction=.20,add_min_gain=.10)
-BALANCED=Params((ProfitTier(.25,.20),ProfitTier(.50,.25),ProfitTier(.75,.25)),.30,.25,2.5)
-AGGRESSIVE=Params((ProfitTier(.30,.15),ProfitTier(.60,.20),ProfitTier(1.00,.25)),.40,.30,3.0,add_min_gain=.15)
+CONSERVATIVE=Params((ProfitTier(.20,.25),ProfitTier(.40,.25),ProfitTier(.65,.20)),.30,.20,2.2,
+                    first_entry_fraction=.35,add_fraction=.15,max_deployed_fraction=.70,add_min_gain=.10)
+BALANCED=Params((ProfitTier(.25,.20),ProfitTier(.50,.25),ProfitTier(.75,.25)),.30,.25,2.5,
+                first_entry_fraction=.50,add_fraction=.25,max_deployed_fraction=1.00)
+AGGRESSIVE=Params((ProfitTier(.30,.15),ProfitTier(.60,.20),ProfitTier(1.00,.25)),.40,.30,3.0,
+                  first_entry_fraction=.60,add_fraction=.20,max_deployed_fraction=1.00,add_min_gain=.15)
 
 @dataclass
 class PositionState:
@@ -130,7 +133,8 @@ def trailing_stop_price(state: PositionState, atr_value: float, params: Params=B
 
 def pyramiding_allowed(state: PositionState, price: float, signal: TrendSnapshot, params: Params=BALANCED):
     price=_f(price)
-    if state.deployed_usd>=state.planned_usd or not signal.entry_ready: return False
+    max_budget=state.planned_usd*params.max_deployed_fraction
+    if state.deployed_usd>=max_budget-1e-9 or not signal.entry_ready: return False
     if price/state.avg_entry-1<params.add_min_gain: return False
     dd=1-price/state.peak_price
     return params.pullback_min<=dd<=params.pullback_max and params.add_rsi_low<=signal.rsi14<=params.add_rsi_high and price>signal.ema20>signal.ema50
@@ -148,7 +152,8 @@ def manage_position(state: PositionState, price: float, signal: TrendSnapshot, l
             if q>0:
                 actions.append(Action("SELL_PART",qty=q,reason=f"TAKE_{int(t.gain*100)}")); state.qty-=q; state.realized_cash+=q*price; state.tier_done.add(i)
     if pyramiding_allowed(state,price,signal,params):
-        remaining=state.planned_usd-state.deployed_usd; usd=min(remaining,state.planned_usd*params.add_fraction)
+        max_budget=state.planned_usd*params.max_deployed_fraction
+        remaining=max(0.0,max_budget-state.deployed_usd); usd=min(remaining,state.planned_usd*params.add_fraction)
         if usd>0:
             actions.append(Action("ADD",usd=usd,reason="PROFITABLE_PULLBACK_RECONFIRMED"))
             old_cost=state.avg_entry*state.qty; q=usd/price; state.qty+=q; state.deployed_usd+=usd; state.avg_entry=(old_cost+usd)/state.qty; state.add_count+=1

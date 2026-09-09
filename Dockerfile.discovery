@@ -1,7 +1,27 @@
-# Paper-scanner: supervised workers, persistence regression, and stock-style shadow research.
+# Paper-scanner: supervised paper workers, strict legacy gates, true OHLCV, event/cross-asset intelligence,
+# sub-second BTC lead-lag research, unified decisions, bounded calibration, and independent paper ledgers.
+FROM node:22-bookworm-slim AS gmgn_cli
+RUN npm install -g gmgn-cli@1.6.1 && gmgn-cli --version
+
 FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-COPY discovery.py test_discovery.py history_replay.py test_history_replay.py launcher.py test_launcher.py strategy_v03.py test_strategy_v03.py strategy_v04.py test_strategy_v04.py strategy_v05.py test_strategy_v05.py strategy_v06.py test_strategy_v06.py strategy_v07.py test_strategy_v07.py strategy_v08.py test_strategy_v08.py shadow_ab.py test_shadow_ab.py stock_style_shadow.py test_stock_style_shadow.py ./
-RUN python -m unittest -v test_discovery test_history_replay test_strategy_v03 test_strategy_v04 test_strategy_v05 test_strategy_v06 test_strategy_v07 test_strategy_v08 test_shadow_ab test_stock_style_shadow test_launcher
+COPY --from=gmgn_cli /usr/local/bin/node /usr/local/bin/node
+COPY --from=gmgn_cli /usr/local/bin/gmgn-cli /usr/local/bin/gmgn-cli
+COPY --from=gmgn_cli /usr/local/lib/node_modules/gmgn-cli /usr/local/lib/node_modules/gmgn-cli
+RUN pip install --no-cache-dir websocket-client==1.9.0
+COPY discovery.py test_discovery.py history_replay.py test_history_replay.py launcher.py test_launcher.py \
+ strategy_v03.py test_strategy_v03.py strategy_v04.py test_strategy_v04.py strategy_v05.py test_strategy_v05.py \
+ strategy_v06.py test_strategy_v06.py strategy_v07.py test_strategy_v07.py strategy_v08.py test_strategy_v08.py \
+ shadow_ab.py test_shadow_ab.py market_regime.py test_market_regime.py live_ohlcv.py test_live_ohlcv.py \
+ stock_style_shadow.py test_stock_style_shadow.py v08_paper.py test_v08_paper.py \
+ cross_asset.py test_cross_asset.py external_events.py test_external_events.py gmgn_intel.py test_gmgn_intel.py \
+ major_microstructure.py test_major_microstructure.py decision_engine.py test_decision_engine.py \
+ decision_worker.py test_decision_worker.py major_paper.py test_major_paper.py \
+ calibration_worker.py test_calibration_worker.py intelligence_hub.py test_intelligence_hub.py ./
+RUN python -m unittest -v \
+ test_discovery test_history_replay test_strategy_v03 test_strategy_v04 test_strategy_v05 test_strategy_v06 test_strategy_v07 test_strategy_v08 \
+ test_shadow_ab test_market_regime test_live_ohlcv test_stock_style_shadow test_v08_paper \
+ test_cross_asset test_external_events test_gmgn_intel test_major_microstructure test_decision_engine test_decision_worker \
+ test_major_paper test_calibration_worker test_intelligence_hub test_launcher
 CMD ["python", "-u", "launcher.py"]

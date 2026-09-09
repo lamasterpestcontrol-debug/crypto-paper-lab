@@ -1,6 +1,6 @@
 import tempfile, unittest
 from pathlib import Path
-from discovery import assess, best_pair, Store
+from discovery import assess, best_pair, Store, App
 
 
 def pair(**kw):
@@ -263,3 +263,16 @@ class AccountingRegressionTests(unittest.TestCase):
 
 if __name__=="__main__": unittest.main()
 
+
+class FeedIntegrityRegressionTests(unittest.TestCase):
+    def test_profile_error_object_is_not_treated_as_empty_healthy_feed(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            store=Store(Path(td)/'x.db');self.addCleanup(store.db.close)
+            app=App(store,Path(td),'x'*16)
+            with patch('discovery.public_json',return_value={'error':'bad response'}):
+                with self.assertRaisesRegex(ValueError,'profile feed is not a list'):
+                    app.scan_once()
+            self.assertEqual(store.db.execute('SELECT COUNT(*) FROM scans').fetchone()[0],0)
