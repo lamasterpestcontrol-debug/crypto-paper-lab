@@ -38,7 +38,6 @@ class T(unittest.TestCase):
             __getattr__=dict.get
         r={'raw_json':json.dumps({'bullish_structure':True,'breakout20':True}),'rsi14':60,'volume_ratio':2}
         self.assertGreater(d.technical_strength(r),70)
-if __name__=='__main__':unittest.main()
 
 class GMGNOnlyInputTests(unittest.TestCase):
     def test_gmgn_only_market_input_requires_three_sightings(self):
@@ -74,3 +73,33 @@ class ExplicitScopeTests(unittest.TestCase):
             db=d.dbopen(Path(td)/'x.db');now=1700000000;self.base_tables(db,now,address='util1',evidence='profile_description;utility_terms:ai;website',score=9)
             counts=d.process_tokens(db,d.DecisionContext('RISK_ON',None,.9),None,now)
             row=db.execute("SELECT scope FROM bot_decisions").fetchone();self.assertEqual(row['scope'],'UTILITY_NEW_TOKEN');self.assertEqual(counts['UTILITY_NEW_TOKEN'],1);db.close()
+
+class PublicMemeRoutingTests(unittest.TestCase):
+    def make_db(self,td,rows):
+        db=d.dbopen(Path(td)/'x.db')
+        db.execute("CREATE TABLE candidates(chain TEXT,address TEXT,symbol TEXT,name TEXT,score REAL,evidence TEXT)")
+        db.executemany("INSERT INTO candidates VALUES(?,?,?,?,?,?)",rows);db.commit();return db
+    def test_obvious_public_meme_symbols_route_without_gmgn(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=self.make_db(td,[
+                ('solana','woof','WOOF','Woof',1,''),
+                ('solana','pepe','WENPEPE','Wen Pepe',1,''),
+                ('solana','inu','INCOGINU','Incoginu',1,''),
+            ])
+            for address in ('woof','pepe','inu'):
+                self.assertEqual(d.token_scope(db,'solana',address,1700000000)[0],'MEME')
+            db.close()
+    def test_boundary_safety_catalog_is_not_cat_meme(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=self.make_db(td,[('solana','catalog','CATALOG','Catalog Protocol',1,'')])
+            self.assertEqual(d.token_scope(db,'solana','catalog',1700000000)[0],'UNCLASSIFIED');db.close()
+    def test_inu_requires_suffix_not_arbitrary_substring(self):
+        self.assertTrue(d._meme_hint('INCOGINU','',''))
+        self.assertFalse(d._meme_hint('MINUTE','Minute Network',''))
+    def test_utility_scope_wins_even_when_symbol_looks_meme(self):
+        with tempfile.TemporaryDirectory() as td:
+            db=self.make_db(td,[('solana','utilitywoof','WOOF','Utility Woof',9,'profile_description;utility_terms:ai;website')])
+            self.assertEqual(d.token_scope(db,'solana','utilitywoof',1700000000)[0],'UTILITY_NEW_TOKEN');db.close()
+
+if __name__=='__main__':
+    unittest.main()

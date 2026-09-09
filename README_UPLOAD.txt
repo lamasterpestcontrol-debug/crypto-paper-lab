@@ -1,13 +1,22 @@
-V11 Railway pre-deploy test isolation fix
+V12 MEME public-routing fix — PAPER ONLY
 
-Upload ONLY test_discovery.py to the root of:
+Upload ONLY these 2 code files to the repository root and replace the same-name files:
+1. decision_worker.py
+2. test_decision_worker.py
+
+Repository:
 lamasterpestcontrol-debug/crypto-paper-lab
 
-Replace the existing test_discovery.py.
-Do not delete or change any other file.
+What this fixes:
+- Obvious public meme candidates such as WOOF / WENPEPE / *INU can enter the existing MEME research path even when GMGN_API_KEY is absent.
+- Utility-new-token classification still wins first when real-utility evidence is strong.
+- Boundary safety prevents false substring matches such as CATALOG -> cat or MINUTE -> inu.
+- This changes classification/routing only. It does NOT lower entry thresholds or bypass true-OHLC, liquidity, persistence, insider, concentration, contract-risk, market-regime, or shock gates.
+- PAPER ONLY. No wallet/order API added.
 
-What this changes:
-- Isolates the malformed-feed unit test from Railway's production volume guard.
-- Does NOT weaken or remove the production persistent-volume safety check.
-- Verified under simulated Railway environment.
-- Full v11 suite: 257 tests passed, 0 failed.
+Local validation performed:
+- Python compile: OK
+- Isolated token_scope routing validation: OK
+- 4 new targeted routing tests: 4/4 OK
+
+After upload, Railway should auto-deploy. Cloud validation must still pass before this is called deployed/working.

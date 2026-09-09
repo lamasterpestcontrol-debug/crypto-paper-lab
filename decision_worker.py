@@ -6,7 +6,7 @@ signals, persistence and optional token-intelligence/GMGN corroboration. It has
 no wallet/order APIs.
 """
 from __future__ import annotations
-import json,math,os,sqlite3,time
+import json,math,os,re,sqlite3,time
 from dataclasses import replace
 from pathlib import Path
 from decision_engine import (Decision,DecisionContext,UtilityTokenInput,MemeTokenInput,MajorLagInput,
@@ -16,8 +16,16 @@ from external_events import latest_state as latest_event_state
 from cross_asset import latest_state as latest_cross_state
 from calibration_worker import latest_active as latest_calibration
 
-VERSION="decision-worker-0.3.0"
+VERSION="decision-worker-0.3.1"
 TRUE_BAR_SOURCE="GECKOTERMINAL_ONCHAIN_OHLCV_MINUTE"
+
+# Scope classification only. These hints do not relax any entry, liquidity,
+# persistence, technical, market-regime, insider, concentration, or contract gate.
+_MEME_WORDS={
+  "meme","memecoin","dog","doge","cat","frog","pepe","shiba","shib","bonk",
+  "woof","wojak","chad","ape","moon","floki","inu","mog","goat","pnut",
+}
+_MEME_SUBSTRINGS=("pepe","doge","shib","bonk","woof","floki")
 
 
 def emit(event,**fields):print(json.dumps({"event":event,"version":VERSION,**fields},separators=(",",":"),allow_nan=False),flush=True)
@@ -26,6 +34,32 @@ def _num(x,default=None):
     try:
         v=float(x);return v if math.isfinite(v) else default
     except Exception:return default
+
+def _normalized_words(text):
+    return " "+re.sub(r"[^a-z0-9]+"," ",str(text or "").lower()).strip()+" "
+
+def _meme_hint(symbol="",name="",evidence=""):
+    """Conservative scope classifier for non-utility tokens.
+
+    Utility scope always wins first. This function only routes obvious meme/speculative
+    candidates into the existing MEME paper path; it never makes a trade decision.
+    """
+    ev=str(evidence or "").lower()
+    if "meme" in ev:
+        return True
+    combined=_normalized_words(f"{symbol} {name}")
+    if any(f" {term} " in combined for term in _MEME_WORDS):
+        return True
+    compact=re.sub(r"[^a-z0-9]+","",f"{symbol} {name}".lower())
+    if any(term in compact for term in _MEME_SUBSTRINGS):
+        return True
+    # "inu" is a common meme suffix, but matching it as an arbitrary substring would
+    # create false positives such as "minute"; require a token/name boundary suffix.
+    for raw in (str(symbol or "").lower(),str(name or "").lower()):
+        cleaned=re.sub(r"[^a-z0-9]+","",raw)
+        if cleaned.endswith("inu") and len(cleaned)>3:
+            return True
+    return False
 
 def dbopen(path:Path):
     db=sqlite3.connect(path,timeout=30);db.row_factory=sqlite3.Row;db.execute("PRAGMA journal_mode=WAL")
@@ -153,15 +187,19 @@ def token_intel(db,chain,address,now,max_age=300):
 def token_scope(db,chain,address,now):
     """Classify runtime path without forcing MEME coins through a utility gate."""
     u=utility_confidence(db,chain,address)
-    evidence=""
+    evidence=symbol=name=""
     try:
-        r=db.execute("SELECT evidence FROM candidates WHERE chain=? AND address=?",(chain,address)).fetchone()
-        evidence=str(r["evidence"] or "") if r else ""
+        r=db.execute("SELECT * FROM candidates WHERE chain=? AND address=?",(chain,address)).fetchone()
+        if r:
+            keys=set(r.keys())
+            evidence=str(r["evidence"] or "") if "evidence" in keys else ""
+            symbol=str(r["symbol"] or "") if "symbol" in keys else ""
+            name=str(r["name"] or "") if "name" in keys else ""
     except sqlite3.OperationalError:pass
     g=gmgn_candidate(db,chain,address,now)
     if u>=55:
         return "UTILITY_NEW_TOKEN",u,g
-    if g is not None or "meme" in evidence.lower():
+    if g is not None or _meme_hint(symbol,name,evidence):
         return "MEME",u,g
     return "UNCLASSIFIED",u,g
 
