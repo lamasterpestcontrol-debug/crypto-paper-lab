@@ -272,7 +272,10 @@ class FeedIntegrityRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store=Store(Path(td)/'x.db');self.addCleanup(store.db.close)
             app=App(store,Path(td),'x'*16)
-            with patch('discovery.public_json',return_value={'error':'bad response'}):
+            # This unit test targets feed validation, not Railway mount validation.
+            # Keep the production persistent-volume guard intact and isolate it here.
+            with patch('discovery.persistent_ready',return_value=True), \
+                 patch('discovery.public_json',return_value={'error':'bad response'}):
                 with self.assertRaisesRegex(ValueError,'profile feed is not a list'):
                     app.scan_once()
             self.assertEqual(store.db.execute('SELECT COUNT(*) FROM scans').fetchone()[0],0)
