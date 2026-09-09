@@ -5,8 +5,9 @@ import launcher
 class T(unittest.TestCase):
     def worker(self,code=None):
         p=Mock();p.poll.return_value=code;p.pid=123;p.wait.return_value=0;return p
-    def test_eight_workers_configured(self):
-        self.assertEqual(len(launcher.COMMANDS),8)
+    def test_nine_workers_configured(self):
+        self.assertEqual(len(launcher.COMMANDS),9)
+        self.assertIn(("robinhood_watch.py",),launcher.COMMANDS)
         self.assertIn(("market_regime.py",),launcher.COMMANDS)
         self.assertIn(("live_ohlcv.py",),launcher.COMMANDS)
         self.assertIn(("v08_paper.py",),launcher.COMMANDS)
