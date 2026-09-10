@@ -5,6 +5,6 @@
     "dockerfilePath": "Dockerfile.discovery"
   },
   "deploy": {
-    "startCommand": "python -u launcher.py"
+    "startCommand": "python -u runtime_bootstrap.py"
   }
 }
