@@ -1,6 +1,7 @@
 import base64
+import contextlib
 import hashlib
-import os
+import io
 import tempfile
 import unittest
 import zlib
@@ -60,16 +61,48 @@ class RuntimeBootstrapTests(unittest.TestCase):
         raw = b"print('bad hash')\n"
         env = {"OPS0": packed(raw), "OPS_API_SHA256": "0" * 64}
         with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(SystemExit) as cm:
+            with self.assertRaises(rb.BundleDecodeError) as cm:
                 rb.decode_hashed_bundle(
                     "OPS", 3, "OPS_API_SHA256", str(Path(td) / "ops.py"), env
                 )
         self.assertIn("OPS_SIDELOAD_INVALID", str(cm.exception))
 
     def test_missing_hash_fails_closed(self):
-        with self.assertRaises(SystemExit) as cm:
-            rb.decode_hashed_bundle("OPS", 3, "OPS_API_SHA256", "/tmp/nope", {"OPS0": "x"})
+        with self.assertRaises(rb.BundleDecodeError) as cm:
+            rb.decode_hashed_bundle(
+                "OPS", 3, "OPS_API_SHA256", "/tmp/nope", {"OPS0": "x"}
+            )
         self.assertEqual(str(cm.exception), "MISSING_HASH_OPS_API_SHA256")
+
+    def test_optional_corrupt_ops_is_isolated(self):
+        env = {
+            "OPS0": "not-valid-base64!",
+            "OPS_API_SHA256": "0" * 64,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                result = rb.decode_optional_hashed_bundle(
+                    "OPS", 3, "OPS_API_SHA256", str(Path(td) / "ops.py"), env
+                )
+        self.assertIsNone(result)
+        output = buf.getvalue()
+        self.assertIn("RUNTIME_AUX_DEGRADED", output)
+        self.assertIn('"core_continues":true', output)
+
+    def test_optional_valid_ops_still_runs_integrity_check(self):
+        raw = b"print('valid optional ops')\n"
+        env = {
+            "OPS0": packed(raw),
+            "OPS_API_SHA256": hashlib.sha256(raw).hexdigest(),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            target = str(Path(td) / "ops.py")
+            result = rb.decode_optional_hashed_bundle(
+                "OPS", 3, "OPS_API_SHA256", target, env
+            )
+            self.assertEqual(result, target)
+            self.assertEqual(Path(target).read_bytes(), raw)
 
     def test_live_mode_is_rejected(self):
         with self.assertRaises(SystemExit) as cm:
@@ -78,8 +111,12 @@ class RuntimeBootstrapTests(unittest.TestCase):
 
     def test_real_trading_flag_is_rejected(self):
         with self.assertRaises(SystemExit) as cm:
-            rb.enforce_paper_only({"MODE": "PAPER", "ENABLE_REAL_TRADING": "true"})
-        self.assertEqual(str(cm.exception), "UNSAFE_TRADING_FLAG_ENABLE_REAL_TRADING")
+            rb.enforce_paper_only(
+                {"MODE": "PAPER", "ENABLE_REAL_TRADING": "true"}
+            )
+        self.assertEqual(
+            str(cm.exception), "UNSAFE_TRADING_FLAG_ENABLE_REAL_TRADING"
+        )
 
     def test_portfolio_requires_all_six_parts(self):
         with self.assertRaises(SystemExit) as cm:

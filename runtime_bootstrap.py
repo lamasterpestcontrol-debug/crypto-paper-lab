@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Resilient PAPER-only runtime bootstrap for paper-scanner.
 
-This file replaces the long Railway inline start command so the production
-runtime is versioned, testable, and reproducible from GitHub.
+Core scanner services fail closed. The auxiliary OPS API is isolated: an OPS
+side-load/configuration failure is reported, but it cannot take down discovery,
+history replay, strategy research, market-regime, OHLCV, paper ledgers, or the
+intelligence hub.
 
 Safety properties:
 - refuses explicit LIVE/REAL modes and real-trading flags;
-- validates AS/MR/WF/B/OPS side-loaded payloads with Base64 + zlib + SHA256;
-- supports valid contiguous one-, two-, or three-part payload layouts;
-- supervises all runtime children and stops the group if any child exits;
+- validates required AS/MR/WF/B payloads with Base64 + zlib + SHA256;
+- supports valid contiguous one-, two-, or three-part side-load layouts;
+- treats OPS as auxiliary and isolates its decode/runtime failure from core;
+- supervises all core children and stops the group if any core child exits;
 - never places real trades.
 """
 
@@ -35,6 +38,10 @@ UNSAFE_FLAG_NAMES = (
     "ENABLE_LIVE_TRADING",
 )
 TRUTHY = {"1", "true", "yes", "on"}
+
+
+class BundleDecodeError(RuntimeError):
+    """A side-loaded runtime bundle failed integrity/format validation."""
 
 
 def _emit(event: str, **fields: object) -> None:
@@ -66,15 +73,11 @@ def decode_hashed_bundle(
     target: str,
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """Decode the first valid contiguous prefix0..prefixN bundle matching SHA256.
-
-    This deliberately tries 1..max_parts. That makes a payload resilient to
-    Railway variable splitting changes while still requiring the expected hash.
-    """
+    """Decode the first valid contiguous prefix0..prefixN bundle matching SHA256."""
     env = os.environ if env is None else env
     expected = env.get(sha_key, "").strip().lower()
     if not expected:
-        raise SystemExit("MISSING_HASH_" + sha_key)
+        raise BundleDecodeError("MISSING_HASH_" + sha_key)
 
     errors: list[str] = []
     for n in range(1, max_parts + 1):
@@ -99,19 +102,37 @@ def decode_hashed_bundle(
         except Exception as exc:
             errors.append(f"{n}p:{type(exc).__name__}")
 
-    raise SystemExit(prefix + "_SIDELOAD_INVALID:" + ",".join(errors[-4:]))
+    raise BundleDecodeError(
+        prefix + "_SIDELOAD_INVALID:" + ",".join(errors[-4:])
+    )
+
+
+def decode_optional_hashed_bundle(
+    prefix: str,
+    max_parts: int,
+    sha_key: str,
+    target: str,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Decode an auxiliary bundle without allowing it to kill core services."""
+    try:
+        return decode_hashed_bundle(prefix, max_parts, sha_key, target, env)
+    except BundleDecodeError as exc:
+        _emit(
+            "RUNTIME_AUX_DEGRADED",
+            bundle=prefix,
+            error_type=type(exc).__name__,
+            reason=str(exc)[:160],
+            core_continues=True,
+        )
+        return None
 
 
 def decode_portfolio_bundle(
     target: str = "/tmp/portfolio_api.py",
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """Decode the legacy six-part PF bundle.
-
-    There is currently no expected PF SHA256 variable in production, so this
-    preserves the existing production behavior exactly: strict Base64/zlib
-    decoding, with failure closed if any part is missing or corrupt.
-    """
+    """Decode the required legacy six-part PF bundle."""
     env = os.environ if env is None else env
     parts = [env.get(f"PF{i}", "") for i in range(6)]
     if not all(parts):
@@ -143,33 +164,42 @@ def run() -> int:
     enforce_paper_only()
 
     portfolio = decode_portfolio_bundle()
-    active_sampler = decode_hashed_bundle(
-        "AS", 3, "ACTIVE_SAMPLER_SHA256", "/tmp/active_paper_sampler.py"
-    )
-    major_replay = decode_hashed_bundle(
-        "MR", 2, "MAJOR_1M_REPLAY_SHA256", "/tmp/major_1m_replay_lab.py"
-    )
-    walkforward = decode_hashed_bundle(
-        "WF", 2, "WALKFORWARD_SHA256", "/tmp/major_walkforward.py"
-    )
-    major_backfill = decode_hashed_bundle(
-        "B", 2, "MAJOR_BACKFILL_SHA256", "/tmp/major_1m_backfill.py"
-    )
-    ops_api = decode_hashed_bundle(
+    try:
+        active_sampler = decode_hashed_bundle(
+            "AS", 3, "ACTIVE_SAMPLER_SHA256", "/tmp/active_paper_sampler.py"
+        )
+        major_replay = decode_hashed_bundle(
+            "MR", 2, "MAJOR_1M_REPLAY_SHA256", "/tmp/major_1m_replay_lab.py"
+        )
+        walkforward = decode_hashed_bundle(
+            "WF", 2, "WALKFORWARD_SHA256", "/tmp/major_walkforward.py"
+        )
+        major_backfill = decode_hashed_bundle(
+            "B", 2, "MAJOR_BACKFILL_SHA256", "/tmp/major_1m_backfill.py"
+        )
+    except BundleDecodeError as exc:
+        _emit(
+            "PAPER_RUNTIME_REQUIRED_BOOTSTRAP_FAIL",
+            error_type=type(exc).__name__,
+            reason=str(exc)[:160],
+        )
+        raise
+
+    ops_api = decode_optional_hashed_bundle(
         "OPS", 3, "OPS_API_SHA256", "/tmp/ops_api.py"
     )
 
-    commands = (
+    core_commands = (
         [sys.executable, "-u", portfolio],
         [sys.executable, "-u", active_sampler],
         [sys.executable, "-u", "launcher.py"],
         [sys.executable, "-u", major_replay],
         [sys.executable, "-u", walkforward],
         [sys.executable, "-u", major_backfill],
-        [sys.executable, "-u", ops_api],
     )
 
-    children: list[subprocess.Popen[bytes]] = []
+    core: list[subprocess.Popen[bytes]] = []
+    aux: subprocess.Popen[bytes] | None = None
     stop_requested = False
 
     def request_stop(signum: int, _frame: object) -> None:
@@ -181,36 +211,59 @@ def run() -> int:
     old_int = signal.signal(signal.SIGINT, request_stop)
 
     try:
-        for command in commands:
-            children.append(subprocess.Popen(command))
+        for command in core_commands:
+            core.append(subprocess.Popen(command))
+
+        if ops_api is not None:
+            aux = subprocess.Popen([sys.executable, "-u", ops_api])
 
         _emit(
             "PAPER_RUNTIME_BOOTSTRAP_OK",
             paper_only=True,
             read_only=True,
             no_real_trading=True,
-            children=len(children),
+            core_children=len(core),
+            ops_aux_available=aux is not None,
         )
-        print(
-            "PORTFOLIO_ACTIVE_SAMPLER_1M_REPLAY_WF_BACKFILL_AND_OPS_STARTED",
-            flush=True,
-        )
+        print("CORE_SCANNER_STARTED_OPS_ISOLATED", flush=True)
 
-        while not stop_requested and all(proc.poll() is None for proc in children):
+        while not stop_requested and all(proc.poll() is None for proc in core):
+            if aux is not None and aux.poll() is not None:
+                _emit(
+                    "RUNTIME_AUX_EXIT",
+                    bundle="OPS",
+                    returncode=aux.returncode,
+                    core_continues=True,
+                )
+                aux = None
             time.sleep(0.5)
 
         if stop_requested:
             return_code = 0
         else:
-            exited = next((p for p in children if p.poll() is not None), None)
-            return_code = exited.returncode if exited and exited.returncode is not None else 1
-            _emit("PAPER_RUNTIME_CHILD_EXIT", returncode=return_code)
+            exited = next((p for p in core if p.poll() is not None), None)
+            return_code = (
+                exited.returncode
+                if exited is not None and exited.returncode is not None
+                else 1
+            )
+            _emit(
+                "PAPER_RUNTIME_CORE_EXIT",
+                returncode=return_code,
+                core_continues=False,
+            )
 
+        children = list(core)
+        if aux is not None:
+            children.append(aux)
         _terminate_children(children)
         return int(return_code)
     finally:
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
+        children = list(core)
+        if aux is not None:
+            children.append(aux)
         if children:
             _terminate_children(children)
 
